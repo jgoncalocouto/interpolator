@@ -306,19 +306,38 @@ def render_tab1():
         y = clean_df[col_y].to_numpy()
         
     with st.expander("Calculation",expanded=True):
-        
+
         st.markdown("#### Select Method & Extrapolation options")
+
+        st.markdown(
+            """
+            **How the methods work**
+
+            * `linear` performs piecewise-linear interpolation between consecutive
+              data points. Inside the data range it solves the line equation for
+              each segment so the result always travels straight from one
+              sample to the next.
+            * `nearest` picks the Y value whose X is closest to the query point.
+              It produces a step-like curve that never invents intermediate
+              values.
+
+            **Extrapolation choices**
+
+            * `clamp` keeps the nearest boundary value whenever the query lies
+              outside the sampled X range. This is often used to avoid
+              extrapolating beyond measured data.
+            * `linear` extends the slope of the first and last line segments to
+              continue the trend outside the known data.
+            """
+        )
 
         # Interpolation settings (inside the tab)
         c1, c2 = st.columns(2)
         with c1:
             method = st.selectbox("Method", ["linear", "nearest"], index=0, key="m1d")
-            st.info("- `linear` for linear interpolation; `nearest` for nearest value lookup.")
-            
         with c2:
             extrap = st.selectbox("Extrapolation", ["clamp", "linear"], index=0, key="e1d",
                                   help="- **clamp**: outside X range, use boundary Y\n- **linear**: extend end slopes")
-            st.info("- `linear` extrapolation extends the end slopes; `clamp` holds the end values.")
 
         # xi input
         st.markdown("#### Paste xi values")
@@ -386,7 +405,7 @@ def render_tab2():
         col_z = st.selectbox("Z column", cols, index=2 if len(cols) > 2 else 0, key="z2d")
         
     with st.expander("Calculation",expanded=True):
-    
+
         c1, c2, c3 = st.columns([1,1,1])
         with c1:
             method = st.selectbox("Method", ["auto", "linear", "nearest", "regular", "rbf"], index=0,
@@ -397,6 +416,31 @@ def render_tab2():
         with c3:
             grid_res = st.slider("Plot grid resolution", 30, 150, 60, 10,
                                  help="Higher = slower but smoother heatmap", key="g2d")
+
+        st.markdown(
+            """
+            **Method overview**
+
+            * `auto` chooses `regular` when the input data form a complete grid
+              of X/Y combinations; otherwise it falls back to `linear`.
+            * `regular` feeds the data into SciPy's `RegularGridInterpolator`
+              for bilinear interpolation on structured grids.
+            * `linear` uses `LinearNDInterpolator` which builds simplices
+              (triangles) over scattered data and performs linear interpolation
+              inside each simplex.
+            * `nearest` relies on `NearestNDInterpolator`, returning the value
+              from the closest known sample point.
+            * `rbf` fits a smooth radial basis function surface (thin plate
+              spline kernel) that passes through all sample points and is often
+              helpful for smoothly varying data.
+
+            **Extrapolation options**
+
+            * `nan` leaves results outside the convex hull undefined (NaN).
+            * `nearest` fills any undefined locations with the value from the
+              nearest known sample.
+            """
+        )
 
         try:
             f2d, meta = build_forward_interpolator(base2d, col_x, col_y, col_z, method=method, extrap=extrap)
