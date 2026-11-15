@@ -1,44 +1,17 @@
 """Regression tests for the interactive interpolation workflows."""
 
-import logging
-from pathlib import Path
+import io
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
-from streamlit.testing.v1 import AppTest
+from streamlit.runtime.media_file_manager import MediaFileManager
+
+from tests.app_test_support import AppTestCase
 
 
-APP = Path(__file__).resolve().parents[1] / "main.py"
-
-
-class WorkflowTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        # Streamlit emits expected bare-mode and version deprecation logs in AppTest.
-        for name in ("streamlit.runtime.scriptrunner_utils.script_run_context",
-                     "streamlit.elements.lib.policies", "streamlit.deprecation_util"):
-            logging.getLogger(name).setLevel(logging.ERROR)
-
-    def setUp(self):
-        self.app = AppTest.from_file(str(APP), default_timeout=20).run()
-        self.assert_no_exception()
-
-    def assert_no_exception(self):
-        self.assertFalse(list(self.app.exception))
-
-    def download(self, dimension):
-        return next(element for element in self.app.get("download_button")
-                    if element.proto.id.endswith(f"-download_{dimension}"))
-
-    def reference_column(self, dimension, index):
-        return next(element for element in self.app.selectbox
-                    if element.key.startswith(f"input_column_{dimension}_")
-                    and element.key.endswith(f"_{index}"))
-
-    def query_column(self, axis):
-        return next(element for element in self.app.selectbox
-                    if element.key.startswith(f"input_query_{axis}_2d"))
+class WorkflowTests(AppTestCase):
 
     def test_both_workflows_render_and_compute_independently(self):
         self.assertEqual(len(self.app.tabs), 2)
@@ -176,8 +149,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.app.button(key="calculate_1d").disabled)
 
     def test_cached_reference_upload_survives_source_switch_and_can_be_cleared(self):
-        # AppTest does not implement file-uploader interactions. Seed the exact
-        # cached file record created by uploaded_table, then exercise the UI.
+        # Isolate cached-file persistence from upload transport. Newer Streamlit
+        # uploader integration is checked separately in test_app_features.py.
         self.app.session_state["cached_upload_reference_1d"] = (
             "known.csv", b"X,Y\n0,0\n1,2\n2,4")
         self.app.radio(key="input_source_1d").set_value("Upload CSV").run()
@@ -213,6 +186,143 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(self.app.button(key="calculate_2d").disabled)
         self.assertTrue(self.download("2d").proto.disabled)
         self.assertEqual(self.app.session_state["generation_upload_queries_2d"], 1)
+
+    def test_explicit_delimiter_override_recovers_from_wrong_interpretation(self):
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        context = "reference_1d_Paste table"
+        self.import_setting(context, "delimiter").set_value("|").run()
+        self.app.text_area(key="input_reference_1d").set_value("X;Y\n0;0\n1;2\n2;4").run()
+        self.app.text_area(key="input_queries_1d_Paste table").set_value("0.5").run()
+        self.assert_no_exception()
+        self.assertTrue(self.app.button(key="calculate_1d").disabled)
+        self.import_setting(context, "delimiter").set_value(";").run()
+        self.assert_no_exception()
+        self.assertFalse(self.app.button(key="calculate_1d").disabled)
+        self.assertTrue(any("Read as:" in item.value for item in self.app.caption))
+        self.app.button(key="calculate_1d").click().run()
+        self.assertEqual(self.app.session_state["result_1d"]["data"]["yi"].iloc[0], 1)
+
+    def test_decimal_comma_and_dot_grouping_are_visible_and_used(self):
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        context = "reference_1d_Paste table"
+        self.import_setting(context, "delimiter").set_value(";").run()
+        self.import_setting(context, "decimal").set_value(",").run()
+        self.import_setting(context, "thousands").set_value(".").run()
+        self.app.text_area(key="input_reference_1d").set_value(
+            "X;Y\n1.000,00;2.000,00\n2.000,00;4.000,00\n3.000,00;6.000,00").run()
+        self.assert_no_exception()
+        preview = self.number_preview("X", "1.000,00")
+        np.testing.assert_allclose(preview["X (number)"], [1000, 2000, 3000])
+        np.testing.assert_allclose(preview["Y (number)"], [2000, 4000, 6000])
+        self.app.text_area(key="input_queries_1d_Paste table").set_value("1500").run()
+        self.app.button(key="calculate_1d").click().run()
+        self.assert_no_exception()
+        self.assertEqual(self.app.session_state["result_1d"]["data"]["yi"].iloc[0], 3000)
+
+    def test_decimal_dot_and_comma_grouping_are_honored(self):
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        context = "reference_1d_Paste table"
+        self.import_setting(context, "delimiter").set_value("|").run()
+        self.import_setting(context, "decimal").set_value(".").run()
+        self.import_setting(context, "thousands").set_value(",").run()
+        self.app.text_area(key="input_reference_1d").set_value(
+            "X|Y\n1,000.25|2,000.5\n2,000.25|4,000.5").run()
+        self.app.text_area(key="input_queries_1d_Paste table").set_value("1500.25").run()
+        self.assert_no_exception()
+        preview = self.number_preview("X", "1,000.25")
+        np.testing.assert_allclose(preview["X (number)"], [1000.25, 2000.25])
+        self.app.button(key="calculate_1d").click().run()
+        self.assert_no_exception()
+        self.assertEqual(self.app.session_state["result_1d"]["data"]["yi"].iloc[0], 3000.5)
+
+    def test_header_override_preserves_first_numeric_row(self):
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        context = "reference_1d_Paste table"
+        self.import_setting(context, "header").set_value(False).run()
+        self.app.text_area(key="input_reference_1d").set_value("0,10\n1,20\n2,30").run()
+        self.app.text_area(key="input_queries_1d_Paste table").set_value("0").run()
+        self.assert_no_exception()
+        self.assertEqual(self.reference_column("1d", 0).value, "col1")
+        self.app.button(key="calculate_1d").click().run()
+        self.assertEqual(self.app.session_state["result_1d"]["data"]["yi"].iloc[0], 10)
+
+    def test_import_format_settings_survive_and_are_scoped_to_their_source(self):
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        paste_context = "reference_1d_Paste table"
+        self.import_setting(paste_context, "delimiter").set_value(";").run()
+        self.import_setting(paste_context, "decimal").set_value(",").run()
+        self.import_setting(paste_context, "thousands").set_value(".").run()
+        self.app.session_state["cached_upload_reference_1d"] = ("known.csv", b"X,Y\n0,0\n1,2")
+        self.app.radio(key="input_source_1d").set_value("Upload CSV").run()
+        upload_context = "reference_1d_Upload CSV"
+        self.assertEqual(self.import_setting(upload_context, "delimiter").value, "auto")
+        self.assertEqual(self.import_setting(upload_context, "decimal").value, "auto")
+        self.assertIsNone(self.import_setting(upload_context, "thousands").value)
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        self.assert_no_exception()
+        self.assertEqual(self.import_setting(paste_context, "delimiter").value, ";")
+        self.assertEqual(self.import_setting(paste_context, "decimal").value, ",")
+        self.assertEqual(self.import_setting(paste_context, "thousands").value, ".")
+
+    def test_2d_query_import_has_independent_number_settings_and_preview(self):
+        context = "queries_2d_Example data_Paste table"
+        self.import_setting(context, "delimiter").set_value(";").run()
+        self.import_setting(context, "decimal").set_value(",").run()
+        self.app.text_area(key="input_queries_2d_Example data").set_value("X;Y\n0,5;0,5\n1,5;1,0").run()
+        self.assert_no_exception()
+        preview = self.number_preview("X", "0,5")
+        np.testing.assert_allclose(preview["X (number)"], [.5, 1.5])
+        np.testing.assert_allclose(preview["Y (number)"], [.5, 1])
+        self.app.button(key="calculate_2d").click().run()
+        self.assert_no_exception()
+        np.testing.assert_allclose(self.app.session_state["result_2d"]["data"]["zi"], [12.75, 17.5])
+
+    def test_number_interpretation_change_marks_previous_result_stale(self):
+        self.app.radio(key="input_source_1d").set_value("Paste table").run()
+        context = "reference_1d_Paste table"
+        self.import_setting(context, "delimiter").set_value(";").run()
+        self.import_setting(context, "decimal").set_value(".").run()
+        self.app.text_area(key="input_reference_1d").set_value("X;Y\n0;1.000\n1;2.000\n2;3.000").run()
+        self.app.text_area(key="input_queries_1d_Paste table").set_value("0.5").run()
+        self.app.button(key="calculate_1d").click().run()
+        original = self.app.session_state["result_1d"]["data"].copy()
+        self.assertEqual(original["yi"].iloc[0], 1.5)
+        self.import_setting(context, "decimal").set_value(",").run()
+        self.import_setting(context, "thousands").set_value(".").run()
+        self.assert_no_exception()
+        self.assertTrue(self.download("1d").proto.disabled)
+        self.assertTrue(any("Inputs have changed" in item.value for item in self.app.warning))
+        pd.testing.assert_frame_equal(original, self.app.session_state["result_1d"]["data"])
+        self.app.button(key="calculate_1d").click().run()
+        self.assert_no_exception()
+        self.assertEqual(self.app.session_state["result_1d"]["data"]["yi"].iloc[0], 1500)
+
+    def test_export_format_changes_csv_bytes_without_invalidating_results(self):
+        self.app.text_area(key="input_queries_1d_Example data").set_value("1.5\n2.5").run()
+        self.app.button(key="calculate_1d").click().run()
+        original = self.app.session_state["result_1d"]["data"].copy()
+        captured = {}
+        original_add = MediaFileManager.add
+
+        def capture(manager, path_or_data, mimetype, coordinates, file_name=None,
+                    is_for_static_download=False):
+            if file_name == "interpolated_1d.csv":
+                captured["csv"] = path_or_data
+            return original_add(manager, path_or_data, mimetype, coordinates, file_name,
+                                is_for_static_download)
+
+        with patch.object(MediaFileManager, "add", new=capture):
+            self.app.selectbox(key="input_export_delimiter_1d").set_value(";").run()
+            self.app.selectbox(key="input_export_decimal_1d").set_value(",").run()
+        self.assert_no_exception()
+        self.assertFalse(self.download("1d").proto.disabled)
+        self.assertFalse(any("Inputs have changed" in item.value for item in self.app.warning))
+        pd.testing.assert_frame_equal(original, self.app.session_state["result_1d"]["data"])
+        self.assertTrue(captured["csv"].startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"xi;yi;status", captured["csv"])
+        self.assertIn(b"1,5;21", captured["csv"])
+        exported = pd.read_csv(io.BytesIO(captured["csv"]), sep=";", decimal=",")
+        pd.testing.assert_frame_equal(original, exported, check_dtype=False)
 
 
 if __name__ == "__main__":

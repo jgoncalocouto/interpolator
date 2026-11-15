@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html import escape
+
 import streamlit as st
 
 DEFAULT_COFFEE_URL = "https://paypal.me/jgoncalocouto/1"
@@ -48,4 +50,5 @@ _FLOATING_BUTTON_HTML = """
 
 def add_buy_me_a_coffee(url: str = DEFAULT_COFFEE_URL, *, title: str = "Buy me a coffee") -> None:
     """Render a floating "Buy me a coffee" button in the current Streamlit app."""
-    st.markdown(_FLOATING_BUTTON_HTML.format(url=url, title=title), unsafe_allow_html=True)
+    st.markdown(_FLOATING_BUTTON_HTML.format(url=escape(url, quote=True), title=escape(title, quote=True)),
+                unsafe_allow_html=True)

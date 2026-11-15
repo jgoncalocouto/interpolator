@@ -1,0 +1,18 @@
+[run]
+branch = True
+relative_files = True
+source =
+    main
+    interpolation
+    coffee_widget
+
+[report]
+show_missing = True
+skip_empty = True
+precision = 1
+fail_under = 90
+exclude_also =
+    if __name__ == ["']__main__["']:
+
+[html]
+directory = htmlcov

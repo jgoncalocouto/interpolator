@@ -13,10 +13,12 @@ from interpolation import (
     build_forward_interpolator,
     interp_linear,
     interp_nearest,
+    numeric_columns,
     parse_float_list,
     prepare_reference,
     read_csv_smart,
     read_pasted_table,
+    result_csv,
 )
 
 
@@ -34,6 +36,66 @@ OUTSIDE = {
     "linear": "Extend end slopes",
     "nearest": "Use nearest sample",
 }
+DELIMITERS = {"auto": "Auto detect", ",": "Comma (,)", ";": "Semicolon (;)",
+              "\t": "Tab", "whitespace": "Whitespace", "|": "Pipe (|)"}
+DECIMALS = {"auto": "Auto detect", ".": "Point (1.25)", ",": "Comma (1,25)"}
+THOUSANDS = {None: "None", ",": "Comma (1,000)", ".": "Point (1.000)",
+             " ": "Space (1 000)", "'": "Apostrophe (1'000)"}
+
+
+def import_settings(context):
+    with st.expander("Import settings"):
+        st.caption("Check the preview below. Override automatic detection if your data is read incorrectly.")
+        left, right = st.columns(2)
+        with left:
+            delimiter = st.selectbox("Column separator", list(DELIMITERS),
+                                      format_func=DELIMITERS.get,
+                                      key=f"input_format_{context}_delimiter")
+            header = st.selectbox("First row contains column names", ["auto", True, False],
+                                   format_func={"auto": "Auto detect", True: "Yes", False: "No"}.get,
+                                   key=f"input_format_{context}_header")
+        with right:
+            decimal = st.selectbox("Decimal separator", list(DECIMALS), format_func=DECIMALS.get,
+                                    key=f"input_format_{context}_decimal")
+            thousands = st.selectbox("Thousands separator (optional)", list(THOUSANDS),
+                                      format_func=THOUSANDS.get,
+                                      key=f"input_format_{context}_thousands",
+                                      help="Choose a grouping separator only if your numbers use one. It is never guessed.")
+        st.caption("Decimal commas and comma-separated columns can be combined when the decimal values are quoted. "
+                   "For unquoted decimal commas, use semicolons or tabs between columns.")
+    return {"delimiter": delimiter, "decimal": decimal, "thousands": thousands, "header": header}
+
+
+def import_summary(frame):
+    info = frame.attrs.get("import_format")
+    if not info:
+        return
+    delimiter = {",": "comma", ";": "semicolon", "\t": "tab", "whitespace": "whitespace", "|": "pipe"}.get(
+        info["delimiter"], str(info["delimiter"]))
+    decimal = "comma" if info["decimal"] == "," else "point"
+    header = "header row" if info["header"] else "no header row"
+    thousands = ("no thousands separator" if info["thousands"] is None else
+                 f"thousands: {THOUSANDS[info['thousands']].lower()}")
+    st.caption(f"Read as: {delimiter} columns · decimal {decimal} · {header} · {thousands}. "
+               f"{len(frame):,} data rows, {len(frame.columns):,} columns.")
+    for warning in info.get("warnings", []):
+        st.warning(warning)
+
+
+def numeric_preview(frame, columns):
+    if "import_format" not in frame.attrs:
+        return
+    numeric = numeric_columns(frame, columns)
+    preview = pd.DataFrame(index=frame.index[:5])
+    config = {}
+    for column in columns:
+        preview[f"{column} (original)"] = frame[column].head(5).astype(str)
+        preview[f"{column} (number)"] = numeric[column].head(5)
+        config[f"{column} (number)"] = st.column_config.NumberColumn(format="%.12g")
+    with st.expander("Check how your numbers are read", expanded=True):
+        st.caption("First five data rows, before excluding invalid values or averaging duplicates. "
+                   "Numeric previews use decimal points. A blank numeric cell means the value could not be read.")
+        st.dataframe(preview, hide_index=True, width="stretch", column_config=config)
 
 
 def example_data(dimension):
@@ -64,18 +126,19 @@ def clear_upload(key):
     st.session_state[f"generation_{key}"] = st.session_state.get(f"generation_{key}", 0) + 1
 
 
-def uploaded_table(label, key):
+def uploaded_table(label, key, context):
     generation = st.session_state.get(f"generation_{key}", 0)
     upload = st.file_uploader(label, type=["csv"], key=f"{key}_{generation}")
     if upload is not None:
         st.session_state[f"cached_{key}"] = (upload.name, upload.getvalue())
     cached = st.session_state.get(f"cached_{key}")
+    options = import_settings(context)
     if cached is None:
         return None
     name, content = cached
     st.caption(f"Loaded: {name}. This file stays available when you switch input sources.")
     st.button("Clear uploaded file", key=f"clear_{key}", on_click=clear_upload, args=(key,))
-    return read_csv_smart(io.BytesIO(content))
+    return read_csv_smart(io.BytesIO(content), **options)
 
 
 def load_table(dimension):
@@ -87,7 +150,8 @@ def load_table(dimension):
             frame = example_data(dimension)
             st.caption("A small example is loaded. Calculate below, or switch to your own data.")
         elif source == "Upload CSV":
-            uploaded = uploaded_table("Choose a reference CSV", f"upload_reference_{dimension}")
+            uploaded = uploaded_table("Choose a reference CSV", f"upload_reference_{dimension}",
+                                       f"reference_{dimension}_{source}")
             if uploaded is not None:
                 frame = uploaded
             else:
@@ -99,18 +163,22 @@ def load_table(dimension):
                                 else "X,Y,Value\n0,0,10\n1,0,12\n0,1,13\n1,1,16",
                                 key=f"input_reference_{dimension}",
                                 help="Paste cells from a spreadsheet, or a comma- or semicolon-separated table. Headers are optional.")
+            options = import_settings(f"reference_{dimension}_{source}")
             if text.strip():
-                frame = read_pasted_table(text)
+                frame = read_pasted_table(text, **options)
             else:
                 st.info("Paste your known data points to get started.")
     except (ValueError, pd.errors.ParserError, UnicodeError) as error:
         st.error(f"Could not read this table. {error}")
 
+    if "import_format" in frame.attrs:
+        import_summary(frame)
+
     with st.expander("Input formats and example CSV"):
         st.write("Use a CSV or paste spreadsheet cells. A header row is optional. "
-                 "For decimal commas, separate table columns with tabs or semicolons. "
-                 "Use a consistent number of columns in every row.")
-        st.download_button("Download example CSV", example_data(dimension).to_csv(index=False),
+                 "Use Import settings to choose column, decimal, and optional thousands separators. "
+                 "Each row must have the same number of columns. The preview shows how your selected values are read.")
+        st.download_button("Download example CSV", result_csv(example_data(dimension)),
                            file_name=f"example_{dimension}.csv", mime="text/csv",
                            key=f"example_download_{dimension}")
     return source, frame
@@ -121,6 +189,8 @@ def reference_inputs(dimension):
     source, raw = load_table(dimension)
     required = 2 if dimension == "1d" else 3
     if raw.empty:
+        if "import_format" in raw.attrs:
+            st.info("No data rows were found. Add your known points, or check whether the first row contains column names.")
         return source, None, None
     if len(raw.columns) < required:
         st.error(f"This table has {len(raw.columns)} column(s). Add at least {required} columns.")
@@ -134,6 +204,7 @@ def reference_inputs(dimension):
             available = [name for name in choices if name not in selected]
             selected.append(select_column(label, available, f"input_column_{dimension}_{source}_{index}"))
     try:
+        numeric_preview(raw, selected)
         clean, stats = prepare_reference(raw, selected)
     except ValueError as error:
         st.error(str(error))
@@ -141,7 +212,8 @@ def reference_inputs(dimension):
 
     if stats["invalid_rows"]:
         st.warning(f"{stats['invalid_rows']:,} of {stats['input_rows']:,} reference rows excluded: "
-                   "a selected cell is empty, nonnumeric, or infinite. Review the original table below.")
+                   "a selected cell is empty, invalid for the chosen number format, or infinite. "
+                   "Check Import settings and the original table below.")
     if stats["duplicates_merged"]:
         coordinates = "X values" if dimension == "1d" else "X/Y pairs"
         st.info(f"{stats['duplicates_merged']:,} duplicate {coordinates} merged by averaging "
@@ -196,15 +268,20 @@ def query_inputs(dimension, source):
             text = st.text_area("X and Y coordinates to estimate", height=140,
                                 key=query_key, placeholder="X,Y\n0.5,0.5\n1.5,1",
                                 help="One coordinate pair per row. Headers are optional.")
+            options = import_settings(f"queries_2d_{source}_{mode}")
             if not text.strip():
                 return None, "Enter X and Y coordinates, one pair per row."
-            raw = read_pasted_table(text)
+            raw = read_pasted_table(text, **options)
         else:
-            uploaded = uploaded_table("Choose a query CSV", "upload_queries_2d")
+            uploaded = uploaded_table("Choose a query CSV", "upload_queries_2d",
+                                       f"queries_2d_{source}_{mode}")
             if uploaded is None:
                 return None, "Choose a CSV containing X and Y query coordinates."
             raw = uploaded
-        if raw.empty or len(raw.columns) < 2:
+        import_summary(raw)
+        if raw.empty:
+            return None, "No query data rows were found. Add coordinate pairs or check the column-name setting."
+        if len(raw.columns) < 2:
             return None, "Query points need at least two columns: X and Y."
         columns = list(raw.columns)
         if len(columns) > 2 or mode == "Upload CSV":
@@ -217,14 +294,13 @@ def query_inputs(dimension, source):
         else:
             qx, qy = columns[:2]
         # Queries keep their order and duplicates; reject invalid rows as a batch.
-        query = raw[[qx, qy]].copy()
-        for col in query:
-            query[col] = pd.to_numeric(query[col].astype(str).str.strip().str.replace(
-                ",", ".", regex=False), errors="coerce")
+        numeric_preview(raw, [qx, qy])
+        query = numeric_columns(raw, [qx, qy])
         valid = np.isfinite(query.to_numpy(dtype=float)).all(axis=1)
         if not valid.all():
             rows = ", ".join(str(i + 1) for i in np.flatnonzero(~valid)[:8])
-            return None, f"Fix query data row(s) {rows}: both coordinates must be finite numbers. No query rows were removed."
+            return None, (f"Fix query data row(s) {rows}: both coordinates must be finite numbers. "
+                          "Check the decimal and thousands settings. No query rows were removed.")
         query.columns = ["xi", "yi"]
         return query.reset_index(drop=True), None
     except (ValueError, pd.errors.ParserError, UnicodeError) as error:
@@ -386,8 +462,23 @@ def render_results(dimension, fingerprint):
     if dimension == "2d":
         column_config["zi"] = st.column_config.NumberColumn(f"Z · {columns[2]}", format="%.6g")
     st.dataframe(saved["data"], hide_index=True, width="stretch", column_config=column_config)
-    st.download_button("Download results as CSV", saved["data"].to_csv(index=False),
-                       file_name=f"interpolated_{dimension}.csv", mime="text/csv",
+    with st.expander("CSV download format"):
+        left, right = st.columns(2)
+        with left:
+            delimiter = st.selectbox("CSV column separator", [",", ";", "\t", "|"],
+                                      format_func=DELIMITERS.get, key=f"input_export_delimiter_{dimension}")
+        with right:
+            decimal = st.selectbox("CSV decimal separator", [".", ","], format_func=DECIMALS.get,
+                                    key=f"input_export_decimal_{dimension}")
+        st.caption("Export settings change the downloaded file. Your calculated values stay the same. "
+                   "UTF-8 encoding preserves column names and symbols in spreadsheets.")
+        preview = result_csv(saved["data"].head(3), delimiter=delimiter, decimal=decimal)
+        st.code(preview.decode("utf-8-sig"), language="text")
+    csv_data = result_csv(saved["data"], delimiter=delimiter, decimal=decimal)
+    extension = "tsv" if delimiter == "\t" else "csv"
+    st.download_button("Download results as CSV" if extension == "csv" else "Download results as TSV", csv_data,
+                       file_name=f"interpolated_{dimension}.{extension}",
+                       mime="text/tab-separated-values" if extension == "tsv" else "text/csv",
                        disabled=stale, key=f"download_{dimension}", width="stretch")
     if stale:
         st.caption("Recalculate to enable the download for your current inputs.")

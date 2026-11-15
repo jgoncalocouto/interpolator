@@ -30,64 +30,217 @@ def _make_unique(names):
     return result
 
 
+_DELIMITER_ALIASES = {
+    "comma": ",", "semicolon": ";", "tab": "\t", "pipe": "|",
+    "space": "whitespace",
+}
+_DELIMITERS = ("\t", ";", ",", "|", "whitespace")
+_THOUSANDS = (None, ",", ".", " ", "'")
+
+
+def _parse_numeric(value, decimal=".", thousands=None):
+    """Convert one value only when its numeric punctuation is well formed."""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    token = str(value).strip()
+    if not token:
+        return np.nan
+    # Keep nonfinite tokens numeric here; callers explicitly reject them when
+    # validating rows. They must never be mistaken for a header.
+    if token.lower() in ("nan", "+nan", "-nan", "inf", "+inf", "-inf",
+                         "infinity", "+infinity", "-infinity"):
+        return float(token)
+    exponent_parts = re.split(r"[eE]", token)
+    if len(exponent_parts) > 2:
+        return np.nan
+    mantissa = exponent_parts[0]
+    exponent = exponent_parts[1] if len(exponent_parts) == 2 else None
+    if exponent is not None and not re.fullmatch(r"[+-]?[0-9]+", exponent):
+        return np.nan
+    sign = ""
+    if mantissa.startswith(("+", "-")):
+        sign, mantissa = mantissa[0], mantissa[1:]
+    if mantissa.count(decimal) > 1:
+        return np.nan
+    parts = mantissa.split(decimal)
+    integer = parts[0]
+    fraction = parts[1] if len(parts) == 2 else None
+    if fraction is not None and fraction and not re.fullmatch(r"[0-9]+", fraction):
+        return np.nan
+    if thousands is not None and thousands in integer:
+        groups = integer.split(thousands)
+        if (not re.fullmatch(r"[0-9]{1,3}", groups[0])
+                or any(not re.fullmatch(r"[0-9]{3}", group) for group in groups[1:])):
+            return np.nan
+        integer = "".join(groups)
+    if integer and not re.fullmatch(r"[0-9]+", integer):
+        return np.nan
+    if not integer and not fraction:
+        return np.nan
+    normalized = sign + (integer or "0")
+    if fraction is not None:
+        normalized += "." + fraction
+    if exponent is not None:
+        normalized += "e" + exponent
+    try:
+        return float(normalized)
+    except ValueError:
+        return np.nan
+
+
 def _looks_numeric(value):
-    try:
-        float(str(value).strip().replace(",", "."))
-        return True
-    except (TypeError, ValueError):
-        return False
+    token = str(value).strip().lower()
+    return (not np.isnan(_parse_numeric(value, "."))
+            or not np.isnan(_parse_numeric(value, ","))
+            or token in ("nan", "+nan", "-nan"))
 
 
-def _parse_table(text: str) -> pd.DataFrame:
-    # Keep edge tabs: they represent missing cells in spreadsheet pastes.
-    text = text.lstrip("\ufeff").strip("\r\n")
-    if not text.strip():
-        return pd.DataFrame()
-    lines = [line for line in text.splitlines() if line.strip()]
-    if any("\t" in line for line in lines):
-        delimiter = "\t"
-    elif any(";" in line for line in lines):
-        delimiter = ";"
-    elif any("," in line for line in lines):
-        # A whitespace table can contain decimal commas. A comma CSV can also
-        # have spaces after commas; those tokens are not themselves numbers.
-        numeric_whitespace_rows = [
-            re.split(r"\s+", line.strip()) for line in lines
-            if len(re.split(r"\s+", line.strip())) > 1
-        ]
-        whitespace_decimals = any(
-            all(_looks_numeric(token) and not token.endswith(",")
-                for token in row)
-            for row in numeric_whitespace_rows
-        )
-        delimiter = None if whitespace_decimals else ","
-    else:
-        delimiter = None
+def _validate_format(delimiter, decimal, thousands, header):
+    delimiter = _DELIMITER_ALIASES.get(delimiter, delimiter)
+    if delimiter not in ("auto", *_DELIMITERS):
+        raise ValueError("Choose comma, semicolon, tab, pipe, or whitespace as the column separator.")
+    if decimal not in ("auto", ".", ","):
+        raise ValueError("Choose a decimal point or decimal comma.")
+    if thousands not in _THOUSANDS:
+        raise ValueError("Choose no thousands separator, comma, point, space, or apostrophe.")
+    if decimal != "auto" and decimal == thousands:
+        raise ValueError("Decimal and thousands separators must be different.")
+    if header != "auto" and not isinstance(header, bool):
+        raise ValueError("Choose automatic header detection, a header row, or no header row.")
+    return delimiter
+
+
+def _read_rows(text, delimiter):
+    if delimiter == "whitespace":
+        # Replace whitespace outside quoted fields; retain CSV escaping and
+        # double-quoted column names containing spaces.
+        lines = [re.sub(r'\s+(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)', "\t", line.strip())
+                 for line in text.splitlines() if line.strip()]
+        text, delimiter = "\n".join(lines), "\t"
     try:
-        if delimiter is None:
-            rows = [re.split(r"\s+", line.strip()) for line in lines]
-        else:
-            rows = list(csv.reader(io.StringIO("\n".join(lines)),
-                                   delimiter=delimiter, skipinitialspace=True,
-                                   strict=True))
+        rows = list(csv.reader(io.StringIO(text), delimiter=delimiter,
+                               skipinitialspace=True, strict=True))
     except csv.Error as error:
         raise ValueError("The table has incomplete quotes. Check the CSV formatting.") from error
-    rows = [[cell.strip() for cell in row] for row in rows]
-    width = len(rows[0])
-    for index, row in enumerate(rows, start=1):
-        if len(row) != width:
-            raise ValueError(
-                f"Row {index} has {len(row)} columns; expected {width}. "
-                "Use the same separator on every row."
-            )
-    has_header = all(not _looks_numeric(cell) for cell in rows[0])
-    columns = (_make_unique(rows[0]) if has_header
-               else [f"col{index + 1}" for index in range(width)])
-    return pd.DataFrame(rows[1:] if has_header else rows, columns=columns)
+    return [[cell.strip() for cell in row] for row in rows
+            if row and not (len(row) == 1 and not row[0].strip())]
 
 
-def read_csv_smart(file) -> pd.DataFrame:
-    """Read UTF-8 or Windows CSV with optional headers and common separators."""
+def _detect_delimiter(text):
+    candidates = []
+    for delimiter in _DELIMITERS:
+        try:
+            rows = _read_rows(text, delimiter)
+        except ValueError:
+            continue
+        widths = [len(row) for row in rows]
+        if widths and max(widths) > 1:
+            candidates.append((delimiter, rows, len(set(widths)) == 1))
+    consistent = [candidate for candidate in candidates if candidate[2]]
+    # Whitespace with decimal commas must not become three CSV columns.
+    # Requiring complete numeric tokens avoids treating '1, 2' as decimals.
+    whitespace = next((candidate for candidate in consistent
+                       if candidate[0] == "whitespace"), None)
+    if whitespace and not any(candidate[0] in ("\t", ";", "|") for candidate in consistent):
+        if any(all(_looks_numeric(cell) and not cell.endswith(",") for cell in row)
+               for row in whitespace[1]):
+            return "whitespace"
+    if consistent:
+        return consistent[0][0]
+    # A malformed table should still be parsed with its likely separator so
+    # the row-length error is visible, rather than collapsing into one column.
+    return candidates[0][0] if candidates else "whitespace"
+
+
+def _infer_decimal(rows, thousands):
+    candidates = [decimal for decimal in (".", ",") if decimal != thousands]
+    counts = {decimal: 0 for decimal in candidates}
+    ambiguous = []
+    mixed_token = False
+    for row in rows:
+        for value in row:
+            token = str(value).strip()
+            for decimal in candidates:
+                if decimal in token and not np.isnan(_parse_numeric(token, decimal, thousands)):
+                    counts[decimal] += 1
+            if thousands is None:
+                if re.fullmatch(r"[+-]?[0-9]{1,3}[.,][0-9]{3}", token):
+                    ambiguous.append(token)
+                if re.fullmatch(r"[+-]?[0-9.,]+(?:[eE][+-]?[0-9]+)?", token) and "." in token and "," in token:
+                    mixed_token = True
+    chosen = max(candidates, key=lambda decimal: counts[decimal])
+    warnings = []
+    if all(counts.get(decimal, 0) for decimal in (".", ",")):
+        name = "point" if chosen == "." else "comma"
+        warnings.append(
+            f"Mixed decimal marks found. Using decimal {name}; values using the other "
+            "mark are invalid. Choose the decimal separator explicitly to correct this."
+        )
+    if ambiguous:
+        example = ambiguous[0]
+        name = "point" if chosen == "." else "comma"
+        warnings.append(
+            f"{example!r} could use a decimal mark or a thousands separator. "
+            f"Assuming decimal {name} and no thousands grouping. Confirm the number format."
+        )
+    if mixed_token:
+        warnings.append(
+            "Some values contain both comma and point punctuation. Thousands grouping "
+            "is never inferred; select decimal and thousands separators explicitly."
+        )
+    return chosen, warnings
+
+
+def _parse_table(text, delimiter="auto", decimal="auto", thousands=None, header="auto"):
+    delimiter = _validate_format(delimiter, decimal, thousands, header)
+    # Keep edge tabs: they represent missing cells in spreadsheet pastes.
+    text = text.lstrip("\ufeff").strip("\r\n")
+    resolved = _detect_delimiter(text) if delimiter == "auto" else delimiter
+    rows = _read_rows(text, resolved) if text.strip() else []
+    if rows:
+        width = len(rows[0])
+        for index, row in enumerate(rows, start=1):
+            if len(row) != width:
+                raise ValueError(
+                    f"Row {index} has {len(row)} columns; expected {width}. "
+                    "Use the same separator on every row or choose the column separator explicitly."
+                )
+    # Number-looking first rows remain data even when their punctuation is
+    # invalid. Header detection must not silently discard a malformed sample.
+    def numeric_header_cell(cell):
+        return _looks_numeric(cell) or bool(re.fullmatch(
+            r"[+-]?(?=[0-9., '\u00a0]*[0-9])[0-9., '\u00a0]+(?:[eE][+-]?[0-9]+)?",
+            cell.strip(),
+        ))
+
+    has_header = (
+        bool(rows) and all(not numeric_header_cell(cell) for cell in rows[0])
+    ) if header == "auto" else header
+    data_rows = rows[1:] if has_header else rows
+    inferred_decimal, warnings = (_infer_decimal(data_rows, thousands)
+                                  if decimal == "auto" else (decimal, []))
+    if rows:
+        columns = (_make_unique(rows[0]) if has_header
+                   else [f"col{index + 1}" for index in range(len(rows[0]))])
+        frame = pd.DataFrame(data_rows, columns=columns)
+    else:
+        frame = pd.DataFrame()
+    frame.attrs["import_format"] = {
+        "delimiter": resolved,
+        "decimal": inferred_decimal,
+        "thousands": thousands,
+        "header": bool(has_header),
+        "warnings": warnings,
+    }
+    return frame
+
+
+def read_csv_smart(file, delimiter="auto", decimal="auto", thousands=None, header="auto"):
+    """Read a file with explicit or reported inferred column/number formats.
+
+    Returns string cells with the resolved settings in ``attrs['import_format']``.
+    Thousands grouping is only accepted when the user selects it explicitly.
+    """
     if hasattr(file, "getvalue"):
         contents = file.getvalue()
     elif hasattr(file, "read"):
@@ -101,16 +254,48 @@ def read_csv_smart(file) -> pd.DataFrame:
             contents = contents.decode("utf-8-sig")
         except UnicodeDecodeError:
             contents = contents.decode("cp1252")
-    return _parse_table(contents)
+    return _parse_table(contents, delimiter, decimal, thousands, header)
 
 
-def read_pasted_table(text: str) -> pd.DataFrame:
-    """Read comma, semicolon, tab, or whitespace tables; headers are optional.
+def read_pasted_table(text, delimiter="auto", decimal="auto", thousands=None, header="auto"):
+    """Read a pasted table using explicit or reported inferred format settings.
 
-    Decimal commas are accepted in semicolon, tab, and whitespace tables.
-    A comma-only table treats commas as column separators.
+    Numeric conversion is separate; call ``numeric_columns`` for a preview.
+    Comma-delimited decimal-comma cells must be quoted, as in standard CSV.
     """
-    return _parse_table(text or "")
+    return _parse_table(text or "", delimiter, decimal, thousands, header)
+
+
+def numeric_columns(df, columns):
+    """Convert selected columns using the table's resolved number format.
+
+    Preserve row order/index and coerce invalid grouping or text to NaN.
+    A programmatically-created DataFrame without import settings infers a
+    decimal mark for backwards compatibility; its numeric cells stay numeric.
+    """
+    columns = list(columns)
+    if any(column not in df.columns for column in columns):
+        raise ValueError("A selected column is no longer available. Select the columns again.")
+    settings = df.attrs.get("import_format", {})
+    decimal = settings.get("decimal", "auto")
+    thousands = settings.get("thousands")
+    _validate_format("auto", decimal, thousands, "auto")
+    if decimal == "auto":
+        decimal, _ = _infer_decimal(df.loc[:, columns].to_numpy().tolist(), thousands)
+    numeric = df.loc[:, columns].copy()
+    for column in columns:
+        numeric[column] = numeric[column].map(lambda value: _parse_numeric(value, decimal, thousands))
+    return numeric
+
+
+def result_csv(df, delimiter=",", decimal="."):
+    """Export UTF-8 CSV with a BOM and proper quoting for the chosen format."""
+    delimiter = _DELIMITER_ALIASES.get(delimiter, delimiter)
+    if delimiter not in (",", ";", "\t", "|", " "):
+        raise ValueError("Choose comma, semicolon, tab, pipe, or space for CSV export.")
+    if decimal not in (".", ","):
+        raise ValueError("Choose a decimal point or decimal comma for CSV export.")
+    return df.to_csv(index=False, sep=delimiter, decimal=decimal).encode("utf-8-sig")
 
 
 def parse_float_list(text: str, decimal_comma: bool = False) -> np.ndarray:
@@ -154,12 +339,7 @@ def prepare_reference(df: pd.DataFrame, columns):
         raise ValueError("Choose a different column for each input and output.")
     if any(column not in df.columns for column in columns):
         raise ValueError("A selected column is no longer available. Select the columns again.")
-    numeric = df.loc[:, columns].copy()
-    for column in columns:
-        numeric[column] = pd.to_numeric(
-            numeric[column].astype(str).str.strip().str.replace(",", ".", regex=False),
-            errors="coerce",
-        )
+    numeric = numeric_columns(df, columns)
     valid = np.isfinite(numeric.to_numpy(dtype=float)).all(axis=1)
     numeric = numeric.loc[valid]
     clean = numeric.groupby(columns[:-1], as_index=False, sort=True)[columns[-1]].mean()
