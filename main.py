@@ -1,550 +1,447 @@
-# interpolator_app.py
+"""Streamlit interface for exploring one- and two-dimensional interpolation."""
+
+import hashlib
 import io
-import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.interpolate import RegularGridInterpolator, LinearNDInterpolator, NearestNDInterpolator, griddata, RBFInterpolator
 
 from coffee_widget import add_buy_me_a_coffee
+from interpolation import (
+    build_forward_interpolator,
+    interp_linear,
+    interp_nearest,
+    parse_float_list,
+    prepare_reference,
+    read_csv_smart,
+    read_pasted_table,
+)
 
-# ---------------------------
-# Page setup
-# ---------------------------
-st.set_page_config(page_title="Interpolator", page_icon="☄", layout="wide")
-st.title("☄ Interpolator")
-st.caption("1-D and 2-D interpolation online tool")
-add_buy_me_a_coffee()
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _make_unique(names):
-    seen, out = {}, []
-    for n in names:
-        base = str(n).strip() or "col"
-        k = seen.get(base, 0)
-        out.append(base if k == 0 else f"{base}.{k}")
-        seen[base] = k + 1
-    return out
+SOURCES = ["Example data", "Upload CSV", "Paste table"]
+METHODS = {
+    "auto": "Automatic (recommended)",
+    "linear": "Linear",
+    "nearest": "Nearest sample",
+    "regular": "Bilinear · complete grid",
+    "rbf": "Smooth surface (RBF)",
+}
+OUTSIDE = {
+    "nan": "Leave blank",
+    "clamp": "Keep boundary value",
+    "linear": "Extend end slopes",
+    "nearest": "Use nearest sample",
+}
 
-def _looks_numeric(s: str) -> bool:
-    s = str(s).strip()
-    if s == "": return False
-    s = s.replace(",", ".")
-    try: float(s); return True
-    except ValueError: return False
 
-def read_csv_smart(file) -> pd.DataFrame:
-    """
-    Smart CSV reader:
-    - If first row looks like headers (non-numeric), use as columns.
-    - Else, keep all rows as data and auto-name columns col1, col2, ...
-    - Auto-detect delimiter (engine='python', sep=None).
-    - Coerce EU-decimal commas when converting later.
-    """
-    raw = pd.read_csv(file, header=None, sep=None, engine="python", dtype=str)
-    if raw.empty: return pd.DataFrame()
-    first_row = raw.iloc[0].tolist()
-    header_like = not any(_looks_numeric(v) for v in first_row)
-    if header_like:
-        cols = _make_unique([str(v).strip() or f"col{i+1}" for i, v in enumerate(first_row)])
-        df = raw.iloc[1:].reset_index(drop=True); df.columns = cols
-    else:
-        df = raw.copy(); df.columns = [f"col{i+1}" for i in range(df.shape[1])]
-    # best-effort numeric (defer strict conversion to where needed)
-    for c in df.columns:
-        try:
-            df[c] = pd.to_numeric(df[c].str.replace(",", ".", regex=False), errors="ignore")
-        except Exception:
-            pass
-    return df
+def example_data(dimension):
+    if dimension == "1d":
+        return pd.DataFrame({"Time (s)": [0, 2, 4, 6, 8, 10],
+                             "Temperature (°C)": [18, 22, 28, 35, 39, 42]})
+    x, y = np.meshgrid([0.0, 1.0, 2.0], [0.0, 1.0, 2.0])
+    return pd.DataFrame({"X": x.ravel(), "Y": y.ravel(),
+                         "Value": (10 + 2 * x + 3 * y + x * y).ravel()})
 
-def read_pasted_table(text: str) -> pd.DataFrame:
-    """
-    Parse pasted table robustly:
-    - Accepts comma, semicolon, or any whitespace as column separators.
-    - Avoids splitting decimal commas (e.g., '3,14').
-    - Promotes first row to header if it looks non-numeric.
-    """
-    text = (text or "").strip()
-    if not text:
-        return pd.DataFrame()
 
-    # Remove carriage returns and strip empty lines
-    lines = [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip()]
-    if not lines:
-        return pd.DataFrame()
+def remember_inputs():
+    # Keep text and settings when their source-specific widgets are hidden.
+    # File uploads have separate keys and are never assigned programmatically.
+    for key in list(st.session_state):
+        if key.startswith("input_"):
+            st.session_state[key] = st.session_state[key]
 
-    # Regex: split on ; or on , (only if not digit,digit), or whitespace
-    # We do it by first protecting decimal commas
-    safe = []
-    for ln in lines:
-        safe.append(re.sub(r"(\d),(\d)", r"\1§\2", ln))  # temporarily replace decimal commas
-    safe_text = "\n".join(safe)
 
+def select_column(label, options, key, index=0):
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = options[min(index, len(options) - 1)]
+    return st.selectbox(label, options, key=key)
+
+
+def clear_upload(key):
+    st.session_state.pop(f"cached_{key}", None)
+    st.session_state[f"generation_{key}"] = st.session_state.get(f"generation_{key}", 0) + 1
+
+
+def uploaded_table(label, key):
+    generation = st.session_state.get(f"generation_{key}", 0)
+    upload = st.file_uploader(label, type=["csv"], key=f"{key}_{generation}")
+    if upload is not None:
+        st.session_state[f"cached_{key}"] = (upload.name, upload.getvalue())
+    cached = st.session_state.get(f"cached_{key}")
+    if cached is None:
+        return None
+    name, content = cached
+    st.caption(f"Loaded: {name}. This file stays available when you switch input sources.")
+    st.button("Clear uploaded file", key=f"clear_{key}", on_click=clear_upload, args=(key,))
+    return read_csv_smart(io.BytesIO(content))
+
+
+def load_table(dimension):
+    source = st.radio("Reference data", SOURCES, horizontal=True,
+                      key=f"input_source_{dimension}")
+    frame = pd.DataFrame()
     try:
-        df = pd.read_csv(
-            io.StringIO(safe_text),
-            sep=r"[;,\s]+",  # split on ; , or whitespace
-            engine="python",
-            header=None
-        )
-    except Exception:
-        return pd.DataFrame({0: lines})
-
-    # Restore decimal commas
-    df = df.applymap(lambda v: str(v).replace("§", ",") if isinstance(v, str) else v)
-
-    if df.empty:
-        return df
-
-    # Smart header detection
-    def _looks_numeric_cell(v) -> bool:
-        s = str(v).strip()
-        if s == "":
-            return False
-        s = s.replace(",", ".")  # allow decimal comma
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
-    first_row = df.iloc[0].tolist()
-    header_like = not any(_looks_numeric_cell(v) for v in first_row)
-
-    if header_like:
-        cols = [str(v).strip() or f"col{i+1}" for i, v in enumerate(first_row)]
-        # Ensure unique
-        seen, uniq = {}, []
-        for c in cols:
-            k = seen.get(c, 0)
-            uniq.append(c if k == 0 else f"{c}.{k}")
-            seen[c] = k + 1
-        df = df.iloc[1:].reset_index(drop=True)
-        df.columns = uniq
-    else:
-        df.columns = [f"col{i+1}" for i in range(df.shape[1])]
-
-    return df
-
-
-
-# --- 1D helpers ---
-def parse_float_list(text: str) -> np.ndarray:
-    text = text.strip()
-    if not text: return np.array([], dtype=float)
-    parts = re.split(r"[,\t;\s]+", text)
-    vals = []
-    for p in parts:
-        if not p: continue
-        try: vals.append(float(p.replace(",", ".")))
-        except ValueError: pass
-    return np.asarray(vals, dtype=float)
-
-def prepare_xy(df: pd.DataFrame, x_col: str, y_col: str):
-    d = df[[x_col, y_col]].copy()
-    d = d.dropna()
-    d[x_col] = pd.to_numeric(d[x_col], errors="coerce")
-    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
-    d = d.dropna()
-    d = d.groupby(x_col, as_index=False)[y_col].mean()
-    d = d.sort_values(x_col).reset_index(drop=True)
-    return d
-
-def interp_linear(x: np.ndarray, y: np.ndarray, xi: np.ndarray, extrap: str):
-    if len(x) < 2:
-        return np.full_like(xi, np.nan, dtype=float)
-    yi = np.interp(xi, x, y, left=np.nan, right=np.nan)
-    x_min, x_max = x[0], x[-1]
-    y_min, y_max = y[0], y[-1]
-    left_mask = xi < x_min
-    right_mask = xi > x_max
-    if extrap == "clamp":
-        yi[left_mask] = y_min
-        yi[right_mask] = y_max
-    else:
-        m_left = (y[1] - y[0]) / (x[1] - x[0])
-        yi[left_mask] = y_min + m_left * (xi[left_mask] - x_min)
-        m_right = (y[-1] - y[-2]) / (x[-1] - x[-2])
-        yi[right_mask] = y_max + m_right * (xi[right_mask] - x_max)
-    return yi
-
-def interp_nearest(x: np.ndarray, y: np.ndarray, xi: np.ndarray, extrap: str):
-    if len(x) == 0: return np.full_like(xi, np.nan, dtype=float)
-    if len(x) == 1: return np.full_like(xi, y[0], dtype=float)
-    idx = np.searchsorted(x, xi)
-    left_idx = np.clip(idx - 1, 0, len(x) - 1)
-    right_idx = np.clip(idx, 0, len(x) - 1)
-    left_dist = np.abs(xi - x[left_idx])
-    right_dist = np.abs(xi - x[right_idx])
-    choose_right = right_dist < left_dist
-    nearest_idx = np.where(choose_right, right_idx, left_idx)
-    yi = y[nearest_idx]
-    return yi  # extrap behaves like clamp
-
-# --- 2D helpers ---
-def dedupe_xy_mean(df, xcol, ycol, zcol):
-    d = df[[xcol, ycol, zcol]].copy().dropna()
-    d[xcol] = pd.to_numeric(d[xcol], errors="coerce")
-    d[ycol] = pd.to_numeric(d[ycol], errors="coerce")
-    d[zcol] = pd.to_numeric(d[zcol], errors="coerce")
-    d = d.dropna()
-    return d.groupby([xcol, ycol], as_index=False)[zcol].mean()
-
-def is_full_grid(x, y):
-    xu, yu = np.unique(x), np.unique(y)
-    return x.size == xu.size * yu.size
-
-def build_forward_interpolator(df, xcol, ycol, zcol, method="auto", extrap="nan"):
-    d = dedupe_xy_mean(df, xcol, ycol, zcol)
-    x, y, z = d[xcol].to_numpy(), d[ycol].to_numpy(), d[zcol].to_numpy()
-    grid = is_full_grid(x, y)
-    if method == "auto":
-        method = "regular" if grid else "linearnd"
-
-    if method == "regular" and grid:
-        X = np.unique(x); Y = np.unique(y)
-        xi = {v:i for i, v in enumerate(X)}; yi = {v:i for i, v in enumerate(Y)}
-        Z = np.full((X.size, Y.size), np.nan)
-        for xv, yv, zv in zip(x, y, z):
-            Z[xi[xv], yi[yv]] = zv
-        bounds_error = (extrap != "nan")
-        fill_value = None if extrap != "nan" else np.nan
-        rgi = RegularGridInterpolator((X, Y), Z, method="linear",
-                                      bounds_error=bounds_error, fill_value=fill_value)
-        def f(XQ, YQ): return rgi(np.column_stack([XQ, YQ]))
-        return f, {"type":"regular", "X":X, "Y":Y, "Z":Z}
-
-    if method in ("linearnd", "linear"):
-        pts = np.column_stack([x, y])
-        f_lin = LinearNDInterpolator(pts, z, fill_value=np.nan if extrap=="nan" else None)
-        f_near = NearestNDInterpolator(pts, z) if extrap == "nearest" else None
-        def f(XQ, YQ):
-            out = f_lin(XQ, YQ)
-            if extrap == "nearest":
-                mask = np.isnan(out)
-                if np.any(mask): out[mask] = f_near(XQ[mask], YQ[mask])
-            return out
-        return f, {"type":"linearnd"}
-
-    if method == "nearest":
-        pts = np.column_stack([x, y])
-        f_near = NearestNDInterpolator(pts, z)
-        def f(XQ, YQ): return f_near(XQ, YQ)
-        return f, {"type":"nearest"}
-
-    if method == "rbf":
-        xmu, xsd = x.mean(), (x.std() or 1.0)
-        ymu, ysd = y.mean(), (y.std() or 1.0)
-        P = np.column_stack([(x - xmu)/xsd, (y - ymu)/ysd])
-        rbf = RBFInterpolator(P, z, kernel="thin_plate_spline")
-        def f(XQ, YQ):
-            PQ = np.column_stack([(XQ - xmu)/xsd, (YQ - ymu)/ysd])
-            return rbf(PQ)
-        return f, {"type":"rbf"}
-
-    pts = np.column_stack([x, y])
-    def f(XQ, YQ):
-        out = griddata(pts, z, (XQ, YQ), method="linear")
-        if extrap == "nearest":
-            near = griddata(pts, z, (XQ, YQ), method="nearest")
-            mask = np.isnan(out)
-            if np.any(mask): out[mask] = near[mask]
-        return out
-    return f, {"type":"griddata"}
-
-# ---------------------------
-# Tabs
-# ---------------------------
-tab1, tab2 = st.tabs(["1-D Interpolation", "2-D Interpolation (forward)"])
-
-def render_tab1():
-    st.subheader("1-D Interpolation: x → y")
-    
-    with st.expander("Upload",expanded=True):
-
-        # --- Base data (x,y) ---
-        left, _ = st.columns(2)
-        with left:
-            mode = st.radio("Provide base (x,y) data via:", ["Upload CSV", "Paste table"], index=0, key="mode1d")
-    
-        base_df = pd.DataFrame()
-        if mode == "Upload CSV":
-            file = st.file_uploader("Upload CSV (1st row = headers; select columns below)", type=["csv"], key="csv1d")
-            if file:
-                base_df = read_csv_smart(file)
-        elif mode == "Paste table":
-            paste = st.text_area("Paste table. Header row recommended.", height=160, key="paste1d")
-            if paste.strip():
-                base_df = read_pasted_table(paste)
-    
-        if base_df.empty:
-            st.info("Load base (x,y) data to continue.")
-            return
-
-    # Column selection
-    with st.expander("Select columns",expanded=True):
-        col_x = st.selectbox("Select X column", options=list(base_df.columns), index=0, key="x1d")
-        col_y = st.selectbox("Select Y column", options=list(base_df.columns), index=1 if base_df.shape[1] > 1 else 0, key="y1d")
-
-        # Clean & prepare
-        clean_df = base_df[[col_x, col_y]].copy()
-        clean_df[col_x] = pd.to_numeric(clean_df[col_x], errors="coerce")
-        clean_df[col_y] = pd.to_numeric(clean_df[col_y], errors="coerce")
-        clean_df = clean_df.dropna(subset=[col_x, col_y])
-
-        if clean_df.empty or clean_df[col_x].nunique() < 2:
-            st.error("Not enough valid numeric data after cleaning. Check your X/Y columns.")
-            return
-
-        clean_df = clean_df.groupby(col_x, as_index=False)[col_y].mean().sort_values(col_x).reset_index(drop=True)
-        st.caption("Reference Data for the interpolation")
-        st.dataframe(clean_df, width="stretch")
-        st.info("Duplicated `x` values are averaged before interpolation")
-
-        x = clean_df[col_x].to_numpy()
-        y = clean_df[col_y].to_numpy()
-        
-    with st.expander("Calculation",expanded=True):
-
-        st.markdown("#### Select Method & Extrapolation options")
-
-        st.markdown(
-            """
-            **How the methods work**
-
-            * `linear` performs piecewise-linear interpolation between consecutive
-              data points. Inside the data range it solves the line equation for
-              each segment so the result always travels straight from one
-              sample to the next.
-            * `nearest` picks the Y value whose X is closest to the query point.
-              It produces a step-like curve that never invents intermediate
-              values.
-
-            **Extrapolation choices**
-
-            * `clamp` keeps the nearest boundary value whenever the query lies
-              outside the sampled X range. This is often used to avoid
-              extrapolating beyond measured data.
-            * `linear` extends the slope of the first and last line segments to
-              continue the trend outside the known data.
-            """
-        )
-
-        # Interpolation settings (inside the tab)
-        c1, c2 = st.columns(2)
-        with c1:
-            method = st.selectbox("Method", ["linear", "nearest"], index=0, key="m1d")
-        with c2:
-            extrap = st.selectbox("Extrapolation", ["clamp", "linear"], index=0, key="e1d",
-                                  help="- **clamp**: outside X range, use boundary Y\n- **linear**: extend end slopes")
-
-        # xi input
-        st.markdown("#### Paste xi values")
-        xi_text = st.text_area("Paste xi values (newlines/commas/tabs/semicolons OK).",
-                               height=140, placeholder="e.g.\n1.0\n2.5\n3.75\n5\n...", key="xi1d")
-        xi = parse_float_list(xi_text)
-        if xi.size == 0:
-            st.info("Paste some xi values to compute interpolated yi.")
-            return
-    
-        # --- Compute button ---
-        compute_1d = st.button("Compute yi", type="primary", key="compute1d")
-        if not compute_1d:
-            st.stop()  # or `return` if you're inside the tab function
-    
-        yi = interp_linear(x, y, xi, extrap=extrap) if method == "linear" else interp_nearest(x, y, xi, extrap=extrap)
-        res = pd.DataFrame({"xi": xi, "yi": yi})
-
-    with st.expander("Results",expanded=True):
-        
-        c3,c4=st.columns(2)
-        
-        with c3:
-            # Results + export
-            st.markdown("#### Results (xi, yi)")
-            st.dataframe(res, use_container_width=True)
-            csv_buf = io.StringIO(); res.to_csv(csv_buf, index=False)
-            st.download_button("⬇️ Download CSV (xi, yi)", data=csv_buf.getvalue().encode("utf-8"),
-                               file_name="interpolated_values.csv", mime="text/csv", key="dl1d")
-        with c4:
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Base (x,y)", line=dict(width=3)))
-            fig.add_trace(go.Scatter(x=res["xi"], y=res["yi"], mode="markers", name="Interpolated (xi, yi)", marker=dict(size=9, color="red")))
-            fig.update_layout(xaxis_title=str(col_x), yaxis_title=str(col_y),
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                              margin=dict(l=10, r=10, t=10, b=10), height=520)
-            st.plotly_chart(fig, use_container_width=True)
-
-def render_tab2():
-    st.subheader("2-D Interpolation: (x, y) ➜ z")
-
-    with st.expander("Upload",expanded=True):
-        # --- Base data (x,y,z) ---
-        left, _ = st.columns(2)
-        with left:
-            mode = st.radio("Provide base (x,y,z) data via:", ["Upload CSV", "Paste table"], index=0, key="mode2d")
-        base2d = pd.DataFrame()
-    
-        if mode == "Upload CSV":
-            f = st.file_uploader("Upload CSV with columns x, y, z (any names; select below)", type=["csv"], key="csv2d")
-            if f: base2d = read_csv_smart(f)
-        elif mode == "Paste table":
-            txt = st.text_area("Paste table (Excel cells OK). Header row recommended.", height=160, key="paste2d")
-            if txt.strip(): base2d = read_pasted_table(txt)
-    
-        if base2d.empty:
-            st.info("Load base (x,y,z) data to continue.")
-            return
-        
-    with st.expander("Select columns",expanded=True):
-        cols = list(base2d.columns)
-        col_x = st.selectbox("X column", cols, index=0, key="x2d")
-        col_y = st.selectbox("Y column", cols, index=1 if len(cols) > 1 else 0, key="y2d")
-        col_z = st.selectbox("Z column", cols, index=2 if len(cols) > 2 else 0, key="z2d")
-        
-    with st.expander("Calculation",expanded=True):
-
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            method = st.selectbox("Method", ["auto", "linear", "nearest", "regular", "rbf"], index=0,
-                                  help="auto: RegularGrid if full grid; else LinearND", key="m2d")
-        with c2:
-            extrap = st.selectbox("Extrapolation", ["nan", "nearest"], index=0,
-                                  help="Outside domain: NaN or nearest value", key="e2d")
-        with c3:
-            grid_res = st.slider("Plot grid resolution", 30, 150, 60, 10,
-                                 help="Higher = slower but smoother heatmap", key="g2d")
-
-        st.markdown(
-            """
-            **Method overview**
-
-            * `auto` chooses `regular` when the input data form a complete grid
-              of X/Y combinations; otherwise it falls back to `linear`.
-            * `regular` feeds the data into SciPy's `RegularGridInterpolator`
-              for bilinear interpolation on structured grids.
-            * `linear` uses `LinearNDInterpolator` which builds simplices
-              (triangles) over scattered data and performs linear interpolation
-              inside each simplex.
-            * `nearest` relies on `NearestNDInterpolator`, returning the value
-              from the closest known sample point.
-            * `rbf` fits a smooth radial basis function surface (thin plate
-              spline kernel) that passes through all sample points and is often
-              helpful for smoothly varying data.
-
-            **Extrapolation options**
-
-            * `nan` leaves results outside the convex hull undefined (NaN).
-            * `nearest` fills any undefined locations with the value from the
-              nearest known sample.
-            """
-        )
-
-        try:
-            f2d, meta = build_forward_interpolator(base2d, col_x, col_y, col_z, method=method, extrap=extrap)
-        except Exception as e:
-            st.error(f"Could not build interpolator: {e}")
-            return
-    
-        # --- Query points (xi, yi) ---
-        st.markdown(f"#### Paste points ({col_x}, {col_y})")
-        
-        qmode = st.radio("Provide queries via:", ["Paste table", "Upload CSV"], horizontal=True, key="qmode2d")
-        qdf = pd.DataFrame()
-        
-        if qmode == "Paste table":
-            qtxt = st.text_area(
-                f"Paste two columns ({col_x}, {col_y}). Headers optional.",
-                height=140,
-                placeholder=f"{col_x}\t{col_y}\n0.0\t0.0\n1.2\t-0.5\n...",
-                key="qtxt2d"
-            )
-            if qtxt.strip():
-                qdf = read_pasted_table(qtxt)
+        if source == "Example data":
+            frame = example_data(dimension)
+            st.caption("A small example is loaded. Calculate below, or switch to your own data.")
+        elif source == "Upload CSV":
+            uploaded = uploaded_table("Choose a reference CSV", f"upload_reference_{dimension}")
+            if uploaded is not None:
+                frame = uploaded
+            else:
+                st.info("Choose a CSV with at least two columns." if dimension == "1d"
+                        else "Choose a CSV with at least three columns.")
         else:
-            qfile = st.file_uploader(
-                f"Upload CSV with {col_x}, {col_y} (any names; select below)",
-                type=["csv"],
-                key="qcsv2d"
-            )
-            if qfile:
-                qdf = read_csv_smart(qfile)
-    
-        if qdf.empty or qdf.shape[1] < 2:
-            st.info(f"Provide at least two columns to interpret as {col_x}, {col_y}.")
-            return
-        
-        q_x, q_y = qdf.columns[0], qdf.columns[1]
-        # Coerce numeric & drop NA
-        Q = qdf[[q_x, q_y]].copy()
-        Q[q_x] = pd.to_numeric(Q[q_x], errors="coerce")
-        Q[q_y] = pd.to_numeric(Q[q_y], errors="coerce")
-        Q = Q.dropna().reset_index(drop=True)
-        if Q.empty:
-            st.error(f"No valid numeric {col_x}, {col_y} after cleaning.")
-            return
-        
-        XQ = Q[q_x].to_numpy()
-        YQ = Q[q_y].to_numpy()
-        
-        # --- Compute button ---
-        compute_2d = st.button("Compute zi", type="primary", key="compute2d")
-        if not compute_2d:
-            st.stop()  # or `return` if inside the tab function
-        
+            text = st.text_area("Paste reference data", height=130,
+                                placeholder="X,Y\n0,10\n1,20\n2,30" if dimension == "1d"
+                                else "X,Y,Value\n0,0,10\n1,0,12\n0,1,13\n1,1,16",
+                                key=f"input_reference_{dimension}",
+                                help="Paste cells from a spreadsheet, or a comma- or semicolon-separated table. Headers are optional.")
+            if text.strip():
+                frame = read_pasted_table(text)
+            else:
+                st.info("Paste your known data points to get started.")
+    except (ValueError, pd.errors.ParserError, UnicodeError) as error:
+        st.error(f"Could not read this table. {error}")
+
+    with st.expander("Input formats and example CSV"):
+        st.write("Use a CSV or paste spreadsheet cells. A header row is optional. "
+                 "For decimal commas, separate table columns with tabs or semicolons. "
+                 "Use a consistent number of columns in every row.")
+        st.download_button("Download example CSV", example_data(dimension).to_csv(index=False),
+                           file_name=f"example_{dimension}.csv", mime="text/csv",
+                           key=f"example_download_{dimension}")
+    return source, frame
+
+
+def reference_inputs(dimension):
+    st.subheader("1. Add known data")
+    source, raw = load_table(dimension)
+    required = 2 if dimension == "1d" else 3
+    if raw.empty:
+        return source, None, None
+    if len(raw.columns) < required:
+        st.error(f"This table has {len(raw.columns)} column(s). Add at least {required} columns.")
+        return source, None, None
+
+    choices, selected = list(raw.columns), []
+    labels = ["X · input", "Y · value to estimate"] if dimension == "1d" else [
+        "X · first input", "Y · second input", "Z · value to estimate"]
+    for index, (column, label) in enumerate(zip(st.columns(required), labels)):
+        with column:
+            available = [name for name in choices if name not in selected]
+            selected.append(select_column(label, available, f"input_column_{dimension}_{source}_{index}"))
+    try:
+        clean, stats = prepare_reference(raw, selected)
+    except ValueError as error:
+        st.error(str(error))
+        return source, None, selected
+
+    if stats["invalid_rows"]:
+        st.warning(f"{stats['invalid_rows']:,} of {stats['input_rows']:,} reference rows excluded: "
+                   "a selected cell is empty, nonnumeric, or infinite. Review the original table below.")
+    if stats["duplicates_merged"]:
+        coordinates = "X values" if dimension == "1d" else "X/Y pairs"
+        st.info(f"{stats['duplicates_merged']:,} duplicate {coordinates} merged by averaging "
+                "their output values.")
+    with st.expander("Review reference data", expanded=False):
+        st.caption("Prepared data used for calculation")
+        st.dataframe(clean, hide_index=True, width="stretch")
+        if stats["invalid_rows"] or stats["duplicates_merged"]:
+            st.caption("Original table")
+            st.dataframe(raw, hide_index=True, width="stretch")
+    if dimension == "1d" and len(clean) < 2:
+        st.error("Choose columns with at least two different numeric X values.")
+        return source, None, selected
+    if dimension == "2d" and len(clean) < 3:
+        st.error("Add at least three different numeric coordinate pairs.")
+        return source, None, selected
+    ranges = " · ".join(f"{name}: {clean[name].min():g} to {clean[name].max():g}"
+                         for name in selected[:-1])
+    st.caption(f"{len(clean):,} reference points ready · {ranges}")
+    return source, clean, selected
+
+
+def query_inputs(dimension, source):
+    if dimension == "1d":
+        query_key = f"input_queries_1d_{source}"
+        if query_key not in st.session_state:
+            st.session_state[query_key] = "1\n3\n7\n12" if source == "Example data" else ""
+        text = st.text_area("X values to estimate", height=140,
+                            key=query_key, placeholder="1\n2.5\n3.75",
+                            help="Separate values with newlines, commas, spaces, or semicolons. "
+                            "Commas separate values unless you enable decimal commas below.")
+        decimal_comma = st.checkbox("Use decimal commas (2,5 → 2.5)",
+                                    key=f"input_decimal_1d_{source}",
+                                    help="Separate decimal-comma values with newlines, spaces, tabs, or semicolons.")
+        if not text.strip():
+            return None, "Enter one or more X values."
         try:
-            ZQ = f2d(XQ, YQ)
-        except Exception as e:
-            st.error(f"Interpolation failed: {e}")
-            return
+            queries = parse_float_list(text, decimal_comma=decimal_comma)
+            if queries.size == 0:
+                return None, "Enter one or more numeric X values."
+            return pd.DataFrame({"xi": queries}), None
+        except ValueError as error:
+            return None, str(error)
+
+    mode = st.radio("Query points", ["Paste table", "Upload CSV"], horizontal=True,
+                    key="input_query_source_2d")
+    try:
+        if mode == "Paste table":
+            query_key = f"input_queries_2d_{source}"
+            if query_key not in st.session_state:
+                st.session_state[query_key] = "X,Y\n0.5,0.5\n1.5,1\n3,1" if source == "Example data" else ""
+            text = st.text_area("X and Y coordinates to estimate", height=140,
+                                key=query_key, placeholder="X,Y\n0.5,0.5\n1.5,1",
+                                help="One coordinate pair per row. Headers are optional.")
+            if not text.strip():
+                return None, "Enter X and Y coordinates, one pair per row."
+            raw = read_pasted_table(text)
+        else:
+            uploaded = uploaded_table("Choose a query CSV", "upload_queries_2d")
+            if uploaded is None:
+                return None, "Choose a CSV containing X and Y query coordinates."
+            raw = uploaded
+        if raw.empty or len(raw.columns) < 2:
+            return None, "Query points need at least two columns: X and Y."
+        columns = list(raw.columns)
+        if len(columns) > 2 or mode == "Upload CSV":
+            left, right = st.columns(2)
+            with left:
+                qx = select_column("Query X column", columns, f"input_query_x_2d_{source}_{mode}")
+            with right:
+                qy = select_column("Query Y column", [c for c in columns if c != qx],
+                                   f"input_query_y_2d_{source}_{mode}")
+        else:
+            qx, qy = columns[:2]
+        # Queries keep their order and duplicates; reject invalid rows as a batch.
+        query = raw[[qx, qy]].copy()
+        for col in query:
+            query[col] = pd.to_numeric(query[col].astype(str).str.strip().str.replace(
+                ",", ".", regex=False), errors="coerce")
+        valid = np.isfinite(query.to_numpy(dtype=float)).all(axis=1)
+        if not valid.all():
+            rows = ", ".join(str(i + 1) for i in np.flatnonzero(~valid)[:8])
+            return None, f"Fix query data row(s) {rows}: both coordinates must be finite numbers. No query rows were removed."
+        query.columns = ["xi", "yi"]
+        return query.reset_index(drop=True), None
+    except (ValueError, pd.errors.ParserError, UnicodeError) as error:
+        return None, f"Could not read query points. {error}"
 
 
-        out = pd.DataFrame({"xi": XQ, "yi": YQ, "zi": ZQ})
-
-    # Results + export
-    with st.expander("Results",expanded=True):
-        c6,c7=st.columns(2)
-        with c6:
-            st.dataframe(out, use_container_width=True)
-            buf = io.StringIO(); out.to_csv(buf, index=False)
-            st.download_button("⬇️ Download CSV (xi, yi, zi)", data=buf.getvalue().encode("utf-8"),
-                               file_name="interpolated_2d.csv", mime="text/csv", key="dl2d")
-        with c7:
-
-            # Plot surface heatmap + points
-            dclean = dedupe_xy_mean(base2d, col_x, col_y, col_z)
-            if dclean.empty:
-                st.info("No valid base points to plot.")
-                return
-            Xmin, Xmax = float(dclean[col_x].min()), float(dclean[col_x].max())
-            Ymin, Ymax = float(dclean[col_y].min()), float(dclean[col_y].max())
-            GX = np.linspace(Xmin, Xmax, grid_res)
-            GY = np.linspace(Ymin, Ymax, grid_res)
-            GXm, GYm = np.meshgrid(GX, GY, indexing="xy")
-            ZG = f2d(GXm.ravel(), GYm.ravel()).reshape(GYm.shape)
-        
-            fig = go.Figure()
-            fig.add_trace(go.Heatmap(x=GX, y=GY, z=ZG, colorbar=dict(title=str(col_z)), zsmooth=False, showscale=True, name="z(x,y)"))
-            fig.add_trace(go.Contour(x=GX, y=GY, z=ZG, contours=dict(showlines=True), showscale=False, line=dict(width=1),
-                                     name="contours", hoverinfo="skip"))
-            fig.add_trace(go.Scattergl(x=dclean[col_x], y=dclean[col_y], mode="markers", name="base (x,y)",
-                                       marker=dict(size=4, opacity=0.5)))
-            fig.add_trace(go.Scattergl(x=out["xi"], y=out["yi"], mode="markers", name="queries (xi,yi)",
-                                       marker=dict(size=9, symbol="x")))
-            fig.update_layout(xaxis_title=str(col_x), yaxis_title=str(col_y),
-                              margin=dict(l=10, r=10, t=10, b=10),
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                              height=600)
-            st.plotly_chart(fig, use_container_width=True)
+def settings_inputs(dimension):
+    left, right = st.columns(2)
+    with left:
+        methods = ["linear", "nearest"] if dimension == "1d" else list(METHODS)
+        method = st.selectbox("Interpolation method", methods, format_func=METHODS.get,
+                              key=f"input_method_{dimension}")
+    with right:
+        outside_options = ["nan", "clamp", "linear"] if dimension == "1d" and method == "linear" else (
+            ["nan", "clamp"] if dimension == "1d" else ["nan", "nearest"])
+        outside_key = f"input_outside_{dimension}"
+        if st.session_state.get(outside_key) not in outside_options:
+            st.session_state[outside_key] = "nan"
+        outside = st.selectbox("Outside known data", outside_options, format_func=OUTSIDE.get,
+                               key=outside_key,
+                               help="Outside values depend on an assumption. Leave blank avoids estimating beyond your data.")
+    with st.expander("Choosing a method"):
+        if dimension == "1d":
+            st.write("**Linear** joins neighboring samples with straight lines. "
+                     "**Nearest sample** returns the closest measured value. "
+                     "The known range runs from the smallest to the largest X.")
+        else:
+            st.write("**Automatic** uses bilinear interpolation for a complete grid, and linear "
+                     "interpolation for scattered points. **Nearest sample** keeps measured values. "
+                     "**Smooth surface (RBF)** fits a smooth surface through the samples. "
+                     "**Bilinear** requires every combination of X and Y to be present.")
+            st.write("The known region is the area enclosed by the outermost reference points "
+                     "(their convex hull). A query can be outside that area even if its X and Y "
+                     "are individually within range.")
+    return method, outside
 
 
-with tab1:
-    render_tab1()
+def signature(source, data, selected, queries, method, outside):
+    if data is None or queries is None:
+        return None
+    content = "|".join([source, repr(selected), data.to_csv(index=False),
+                        queries.to_csv(index=False), method, outside])
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-with tab2:
-    render_tab2()
+
+def result_status(inside, values, outside):
+    result = np.where(inside, "Interpolated", "Outside · left blank").astype(object)
+    result[~inside & np.isfinite(values)] = {
+        "clamp": "Outside · boundary value",
+        "linear": "Outside · extended slope",
+        "nearest": "Outside · nearest sample",
+    }.get(outside, "Outside · left blank")
+    result[inside & ~np.isfinite(values)] = "Unavailable"
+    return result
+
+
+def make_chart(dimension, data, selected, out, method, outside, interpolator=None):
+    fig = go.Figure()
+    if dimension == "1d":
+        x, y = (data[c].to_numpy() for c in selected)
+        # Evaluate the actual method so nearest-neighbor charts show their steps.
+        if method == "nearest":
+            midpoints = (x[:-1] + x[1:]) / 2
+            gx = np.unique(np.r_[x, midpoints, np.nextafter(midpoints, np.inf)])
+        else:
+            gx = np.unique(np.r_[np.linspace(x.min(), x.max(), 400), x])
+        fn = interp_linear if method == "linear" else interp_nearest
+        fig.add_trace(go.Scatter(x=gx, y=fn(x, y, gx, outside), mode="lines",
+                                 name="Interpolation", line=dict(color="#0f766e", width=2,
+                                                                 shape="hv" if method == "nearest" else "linear")))
+        fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="Reference samples",
+                                 marker=dict(size=7, color="#0f766e")))
+        y_title = selected[1]
+    else:
+        xcol, ycol, zcol = selected
+        gx = np.linspace(data[xcol].min(), data[xcol].max(), 55)
+        gy = np.linspace(data[ycol].min(), data[ycol].max(), 55)
+        mx, my = np.meshgrid(gx, gy)
+        z = interpolator(mx.ravel(), my.ravel()).reshape(mx.shape)
+        fig.add_trace(go.Heatmap(x=gx, y=gy, z=z, colorscale="Teal", colorbar=dict(title=zcol),
+                                 hovertemplate="X: %{x}<br>Y: %{y}<br>Value: %{z}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=data[xcol], y=data[ycol], mode="markers", name="Reference samples",
+                                 marker=dict(size=6, color="#172b4d", line=dict(color="white", width=1))))
+        y_title = ycol
+    output_col = "yi" if dimension == "1d" else "zi"
+    for is_outside, name, color, symbol in [(False, "Interpolated queries", "#2563eb", "circle"),
+                                            (True, "Outside known data", "#b45309", "diamond")]:
+        points = out[out["status"].str.startswith("Outside") == is_outside]
+        if dimension == "1d":
+            # Blank results have no Y position, so their status remains in the table.
+            points = points[np.isfinite(points[output_col])]
+        if not points.empty:
+            fig.add_trace(go.Scatter(x=points["xi"], y=points["yi"], mode="markers", name=name,
+                                     customdata=points[[output_col, "status"]].to_numpy(),
+                                     hovertemplate="X: %{x}<br>Y: %{y}<br>Value: %{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+                                     marker=dict(size=10, color=color, symbol=symbol,
+                                                 line=dict(width=1, color="white"))))
+    fig.update_layout(xaxis_title=selected[0], yaxis_title=y_title, height=390,
+                      margin=dict(l=10, r=10, t=15, b=10),
+                      legend=dict(orientation="h", y=-0.23, x=0),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+def calculate(dimension, data, selected, query, method, outside, fingerprint):
+    out = query.copy()
+    interpolator = None
+    if dimension == "1d":
+        x, y = (data[c].to_numpy() for c in selected)
+        values = (interp_linear if method == "linear" else interp_nearest)(
+            x, y, query["xi"].to_numpy(), outside)
+        inside = query["xi"].between(x.min(), x.max()).to_numpy()
+        actual_method = METHODS[method]
+    else:
+        interpolator, meta = build_forward_interpolator(data, *selected, method=method, extrap=outside)
+        xq, yq = query["xi"].to_numpy(), query["yi"].to_numpy()
+        values = interpolator(xq, yq)
+        inside = meta["inside_domain"](xq, yq)
+        actual_method = {"regular": "Bilinear · complete grid", "linearnd": "Linear · scattered points",
+                         "linear": "Linear · scattered points", "nearest": "Nearest sample",
+                         "rbf": "Smooth surface (RBF)"}.get(meta["type"], meta["type"])
+    out["yi" if dimension == "1d" else "zi"] = values
+    out["status"] = result_status(inside, values, outside)
+    record = {"fingerprint": fingerprint, "data": out, "columns": selected,
+              "method": actual_method, "outside": OUTSIDE[outside],
+              "outside_count": int((~inside).sum()), "chart": None, "chart_error": None}
+    try:
+        record["chart"] = make_chart(dimension, data, selected, out, method, outside, interpolator)
+    except (ValueError, RuntimeError):
+        record["chart_error"] = "The chart could not be drawn. Your calculated table is still available."
+    return record
+
+
+def render_results(dimension, fingerprint):
+    st.subheader("3. Inspect results")
+    saved = st.session_state.get(f"result_{dimension}")
+    if saved is None:
+        st.info("Ready when you are. Add your query points and select Calculate values.")
+        st.caption("Your results will include a chart, a table, and a CSV download.")
+        return
+    stale = saved["fingerprint"] != fingerprint
+    if stale:
+        st.warning("Inputs have changed. These are your previous results. Calculate again to update them.")
+    else:
+        st.success(f"Calculated {len(saved['data']):,} query point(s).")
+    st.caption(f"{saved['method']} · Outside known data: {saved['outside'].lower()}")
+    if saved["outside_count"]:
+        st.info(f"{saved['outside_count']:,} query point(s) outside the known data region. "
+                "Check the status column before using these results.")
+    if saved["chart"] is not None:
+        st.plotly_chart(saved["chart"], width="stretch", key=f"plot_{dimension}",
+                        config={"scrollZoom": False, "displaylogo": False})
+    if saved["chart_error"]:
+        st.info(saved["chart_error"])
+    columns = saved["columns"]
+    column_config = {"xi": st.column_config.NumberColumn(f"X · {columns[0]}", format="%.6g"),
+                     "yi": st.column_config.NumberColumn(f"Y · {columns[1]}", format="%.6g"),
+                     "status": st.column_config.TextColumn("Status")}
+    if dimension == "2d":
+        column_config["zi"] = st.column_config.NumberColumn(f"Z · {columns[2]}", format="%.6g")
+    st.dataframe(saved["data"], hide_index=True, width="stretch", column_config=column_config)
+    st.download_button("Download results as CSV", saved["data"].to_csv(index=False),
+                       file_name=f"interpolated_{dimension}.csv", mime="text/csv",
+                       disabled=stale, key=f"download_{dimension}", width="stretch")
+    if stale:
+        st.caption("Recalculate to enable the download for your current inputs.")
+    else:
+        st.caption("CSV includes every query in its original order, full numeric precision, and a status column.")
+
+
+def render_workflow(dimension):
+    with st.container(border=True):
+        source, data, selected = reference_inputs(dimension)
+    controls, results = st.columns([1, 1.5], gap="large")
+    with controls:
+        st.subheader("2. Choose what to estimate")
+        query, query_error = query_inputs(dimension, source)
+        method, outside = settings_inputs(dimension)
+        fingerprint = signature(source, data, selected, query, method, outside)
+        if query_error:
+            if query_error.startswith(("Enter ", "Choose ")):
+                st.caption(query_error)
+            else:
+                st.error(query_error)
+        elif query is not None:
+            st.caption(f"{len(query):,} query point(s) ready. Query order and duplicates are preserved.")
+        if data is None:
+            st.caption("Add valid reference data in step 1 to enable calculation.")
+        if st.button("Calculate values", type="primary", key=f"calculate_{dimension}",
+                     disabled=fingerprint is None, width="stretch"):
+            try:
+                with st.spinner("Calculating values…"):
+                    result = calculate(dimension, data, selected, query, method, outside, fingerprint)
+                st.session_state[f"result_{dimension}"] = result
+            except (ValueError, RuntimeError) as error:
+                st.error(f"Could not calculate values. {error}")
+    with results:
+        render_results(dimension, fingerprint)
+
+
+def main():
+    st.set_page_config(page_title="Interpolator", page_icon="📈", layout="wide")
+    add_buy_me_a_coffee()
+    remember_inputs()
+    st.markdown("""<style>
+        .block-container { max-width: 1440px; padding-top: 2rem; }
+        h1 { letter-spacing: -0.035em; }
+    </style>""", unsafe_allow_html=True)
+    st.title("Interpolator")
+    st.write("Estimate values between known data points.")
+    st.caption("Add known data → Choose query points → Inspect and download results")
+    tab1, tab2 = st.tabs(["1D · Find Y from X", "2D · Find Z from X and Y"])
+    with tab1:
+        render_workflow("1d")
+    with tab2:
+        render_workflow("2d")
+
+
+if __name__ == "__main__":
+    main()
