@@ -1,6 +1,14 @@
 [theme]
-primaryColor = "#0f766e"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f1f5f9"
-textColor = "#172b4d"
-font = "sans serif"
+base = "light"
+primaryColor = "#6251c6"
+backgroundColor = "#f6f7fb"
+secondaryBackgroundColor = "#fafbfe"
+textColor = "#252b3b"
+font = "Inter, sans-serif"
+baseFontSize = 14
+baseRadius = "0.4375rem"
+buttonRadius = "0.4375rem"
+borderColor = "#e5e7ee"
+dataframeHeaderBackgroundColor = "#f0edff"
+showWidgetBorder = true
+headingFontSizes = ["2.5rem", "1.65rem", "1.2rem", "1rem", "1rem", "1rem"]

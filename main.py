@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from coffee_widget import add_buy_me_a_coffee
+from column_picker import select_column
 from interpolation import (
     build_forward_interpolator,
     interp_linear,
@@ -41,6 +42,51 @@ DELIMITERS = {"auto": "Auto detect", ",": "Comma (,)", ";": "Semicolon (;)",
 DECIMALS = {"auto": "Auto detect", ".": "Point (1.25)", ",": "Comma (1,25)"}
 THOUSANDS = {None: "None", ",": "Comma (1,000)", ".": "Point (1.000)",
              " ": "Space (1 000)", "'": "Apostrophe (1'000)"}
+
+
+def read_table_cached(content, options, context, *, uploaded=False):
+    """Retain only the latest parsed table per workflow, within this session."""
+    payload = content if isinstance(content, bytes) else content.encode("utf-8")
+    identity = hashlib.sha256(payload + repr(options).encode("utf-8")).hexdigest()
+    cache_key = f"_parsed_{context}"
+    cached = st.session_state.get(cache_key)
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    frame = (read_csv_smart(io.BytesIO(payload), **options) if uploaded
+             else read_pasted_table(content, **options))
+    frame.attrs["input_identity"] = identity
+    st.session_state[cache_key] = (identity, frame)
+    return frame
+
+
+def prepare_reference_cached(raw, selected, dimension):
+    identity = (raw.attrs.get("input_identity", "example"), tuple(selected))
+    cache_key = f"_prepared_reference_{dimension}"
+    cached = st.session_state.get(cache_key)
+    if cached is None or cached[0] != identity:
+        clean, stats = prepare_reference(raw, selected)
+        st.session_state[cache_key] = (identity, clean, stats)
+    else:
+        _, clean, stats = cached
+    clean.attrs["input_identity"] = identity
+    clean.attrs["source_label"] = raw.attrs.get("source_label", "Example data")
+    return clean, stats
+
+
+def numeric_query_cached(raw, selected):
+    identity = (raw.attrs["input_identity"], tuple(selected))
+    cached = st.session_state.get("_prepared_queries_2d")
+    if cached is None or cached[0] != identity:
+        query = numeric_columns(raw, selected)
+        valid = np.isfinite(query.to_numpy(dtype=float)).all(axis=1)
+        query.columns = ["xi", "yi"]
+        query = query.reset_index(drop=True)
+        st.session_state["_prepared_queries_2d"] = (identity, query, valid)
+    else:
+        _, query, valid = cached
+    query.attrs["source_label"] = raw.attrs.get("source_label", "Pasted query table")
+    query.attrs["column_roles"] = tuple(selected)
+    return query, valid
 
 
 def import_settings(context):
@@ -76,7 +122,7 @@ def import_summary(frame):
     header = "header row" if info["header"] else "no header row"
     thousands = ("no thousands separator" if info["thousands"] is None else
                  f"thousands: {THOUSANDS[info['thousands']].lower()}")
-    st.caption(f"Read as: {delimiter} columns · decimal {decimal} · {header} · {thousands}. "
+    st.write(f"Read as: {delimiter} columns · decimal {decimal} · {header} · {thousands}. "
                f"{len(frame):,} data rows, {len(frame.columns):,} columns.")
     for warning in info.get("warnings", []):
         st.warning(warning)
@@ -85,14 +131,14 @@ def import_summary(frame):
 def numeric_preview(frame, columns):
     if "import_format" not in frame.attrs:
         return
-    numeric = numeric_columns(frame, columns)
+    numeric = numeric_columns(frame.head(5), columns)
     preview = pd.DataFrame(index=frame.index[:5])
     config = {}
     for column in columns:
         preview[f"{column} (original)"] = frame[column].head(5).astype(str)
         preview[f"{column} (number)"] = numeric[column].head(5)
         config[f"{column} (number)"] = st.column_config.NumberColumn(format="%.12g")
-    with st.expander("Check how your numbers are read", expanded=True):
+    with st.expander("Check how your numbers are read", expanded=False):
         st.caption("First five data rows, before excluding invalid values or averaging duplicates. "
                    "Numeric previews use decimal points. A blank numeric cell means the value could not be read.")
         st.dataframe(preview, hide_index=True, width="stretch", column_config=config)
@@ -115,14 +161,11 @@ def remember_inputs():
             st.session_state[key] = st.session_state[key]
 
 
-def select_column(label, options, key, index=0):
-    if st.session_state.get(key) not in options:
-        st.session_state[key] = options[min(index, len(options) - 1)]
-    return st.selectbox(label, options, key=key)
-
-
 def clear_upload(key):
     st.session_state.pop(f"cached_{key}", None)
+    context = "queries_2d" if key == "upload_queries_2d" else key.removeprefix("upload_")
+    st.session_state.pop(f"_parsed_{context}", None)
+    st.session_state.pop(f"_prepared_{context}", None)
     st.session_state[f"generation_{key}"] = st.session_state.get(f"generation_{key}", 0) + 1
 
 
@@ -138,7 +181,10 @@ def uploaded_table(label, key, context):
     name, content = cached
     st.caption(f"Loaded: {name}. This file stays available when you switch input sources.")
     st.button("Clear uploaded file", key=f"clear_{key}", on_click=clear_upload, args=(key,))
-    return read_csv_smart(io.BytesIO(content), **options)
+    frame = read_table_cached(content, options, key.removeprefix("upload_"), uploaded=True)
+    # Filename is part of source identity, even if the numerical cells are identical.
+    frame.attrs["source_label"] = f"Uploaded CSV · {name}"
+    return frame
 
 
 def load_table(dimension):
@@ -148,6 +194,8 @@ def load_table(dimension):
     try:
         if source == "Example data":
             frame = example_data(dimension)
+            frame.attrs["input_identity"] = f"example_{dimension}"
+            frame.attrs["source_label"] = "Example data"
             st.caption("A small example is loaded. Calculate below, or switch to your own data.")
         elif source == "Upload CSV":
             uploaded = uploaded_table("Choose a reference CSV", f"upload_reference_{dimension}",
@@ -165,7 +213,8 @@ def load_table(dimension):
                                 help="Paste cells from a spreadsheet, or a comma- or semicolon-separated table. Headers are optional.")
             options = import_settings(f"reference_{dimension}_{source}")
             if text.strip():
-                frame = read_pasted_table(text, **options)
+                frame = read_table_cached(text, options, f"reference_{dimension}")
+                frame.attrs["source_label"] = "Pasted reference table"
             else:
                 st.info("Paste your known data points to get started.")
     except (ValueError, pd.errors.ParserError, UnicodeError) as error:
@@ -205,7 +254,7 @@ def reference_inputs(dimension):
             selected.append(select_column(label, available, f"input_column_{dimension}_{source}_{index}"))
     try:
         numeric_preview(raw, selected)
-        clean, stats = prepare_reference(raw, selected)
+        clean, stats = prepare_reference_cached(raw, selected, dimension)
     except ValueError as error:
         st.error(str(error))
         return source, None, selected
@@ -251,10 +300,19 @@ def query_inputs(dimension, source):
         if not text.strip():
             return None, "Enter one or more X values."
         try:
-            queries = parse_float_list(text, decimal_comma=decimal_comma)
-            if queries.size == 0:
+            identity = (text, decimal_comma)
+            cached = st.session_state.get("_prepared_queries_1d")
+            if cached is None or cached[0] != identity:
+                queries = parse_float_list(text, decimal_comma=decimal_comma)
+                query = pd.DataFrame({"xi": queries})
+                query.attrs["input_identity"] = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+                query.attrs["source_label"] = "Entered X values"
+                st.session_state["_prepared_queries_1d"] = (identity, query)
+            else:
+                query = cached[1]
+            if query.empty:
                 return None, "Enter one or more numeric X values."
-            return pd.DataFrame({"xi": queries}), None
+            return query, None
         except ValueError as error:
             return None, str(error)
 
@@ -271,7 +329,8 @@ def query_inputs(dimension, source):
             options = import_settings(f"queries_2d_{source}_{mode}")
             if not text.strip():
                 return None, "Enter X and Y coordinates, one pair per row."
-            raw = read_pasted_table(text, **options)
+            raw = read_table_cached(text, options, "queries_2d")
+            raw.attrs["source_label"] = "Pasted query table"
         else:
             uploaded = uploaded_table("Choose a query CSV", "upload_queries_2d",
                                        f"queries_2d_{source}_{mode}")
@@ -284,25 +343,20 @@ def query_inputs(dimension, source):
         if len(raw.columns) < 2:
             return None, "Query points need at least two columns: X and Y."
         columns = list(raw.columns)
-        if len(columns) > 2 or mode == "Upload CSV":
-            left, right = st.columns(2)
-            with left:
-                qx = select_column("Query X column", columns, f"input_query_x_2d_{source}_{mode}")
-            with right:
-                qy = select_column("Query Y column", [c for c in columns if c != qx],
-                                   f"input_query_y_2d_{source}_{mode}")
-        else:
-            qx, qy = columns[:2]
+        left, right = st.columns(2)
+        with left:
+            qx = select_column("Query X column", columns, f"input_query_x_2d_{source}_{mode}")
+        with right:
+            qy = select_column("Query Y column", [c for c in columns if c != qx],
+                               f"input_query_y_2d_{source}_{mode}")
         # Queries keep their order and duplicates; reject invalid rows as a batch.
         numeric_preview(raw, [qx, qy])
-        query = numeric_columns(raw, [qx, qy])
-        valid = np.isfinite(query.to_numpy(dtype=float)).all(axis=1)
+        query, valid = numeric_query_cached(raw, [qx, qy])
         if not valid.all():
             rows = ", ".join(str(i + 1) for i in np.flatnonzero(~valid)[:8])
             return None, (f"Fix query data row(s) {rows}: both coordinates must be finite numbers. "
                           "Check the decimal and thousands settings. No query rows were removed.")
-        query.columns = ["xi", "yi"]
-        return query.reset_index(drop=True), None
+        return query, None
     except (ValueError, pd.errors.ParserError, UnicodeError) as error:
         return None, f"Could not read query points. {error}"
 
@@ -335,15 +389,30 @@ def settings_inputs(dimension):
             st.write("The known region is the area enclosed by the outermost reference points "
                      "(their convex hull). A query can be outside that area even if its X and Y "
                      "are individually within range.")
+    summary = {
+        "auto": "Uses bilinear interpolation for a complete grid; linear for scattered points.",
+        "linear": ("Straight lines between neighboring samples." if dimension == "1d" else
+                   "A piecewise linear surface between scattered samples."),
+        "nearest": "Returns the closest known sample; values change in steps.",
+        "regular": "Bilinear interpolation requires a complete rectangular X/Y grid.",
+        "rbf": "Fits a smooth surface. Distances use scaled coordinate axes.",
+    }
+    st.caption(summary[method])
     return method, outside
 
 
 def signature(source, data, selected, queries, method, outside):
     if data is None or queries is None:
         return None
-    content = "|".join([source, repr(selected), data.to_csv(index=False),
-                        queries.to_csv(index=False), method, outside])
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(repr((source, selected, method, outside,
+                                data.attrs.get("input_identity"),
+                                data.attrs.get("source_label"),
+                                queries.attrs.get("input_identity"),
+                                queries.attrs.get("source_label"),
+                                queries.attrs.get("column_roles"))).encode("utf-8"))
+    for frame in (data, queries):
+        digest.update(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes())
+    return digest.hexdigest()
 
 
 def result_status(inside, values, outside):
@@ -358,6 +427,13 @@ def result_status(inside, values, outside):
 
 
 def make_chart(dimension, data, selected, out, method, outside, interpolator=None):
+    from html import escape
+
+    # Keep the same visual roles across methods and modes. Marker shapes also
+    # identify measured samples, queries, and outside-data estimates.
+    colors = {"estimate": "#6251c6", "sample": "#252b3b",
+              "query": "#087e8b", "outside": "#9a4b05", "grid": "#e5e7ee"}
+    labels = [escape(str(column)) for column in selected]
     fig = go.Figure()
     if dimension == "1d":
         x, y = (data[c].to_numpy() for c in selected)
@@ -369,10 +445,15 @@ def make_chart(dimension, data, selected, out, method, outside, interpolator=Non
             gx = np.unique(np.r_[np.linspace(x.min(), x.max(), 400), x])
         fn = interp_linear if method == "linear" else interp_nearest
         fig.add_trace(go.Scatter(x=gx, y=fn(x, y, gx, outside), mode="lines",
-                                 name="Interpolation", line=dict(color="#0f766e", width=2,
-                                                                 shape="hv" if method == "nearest" else "linear")))
+                                 name="Interpolation", line=dict(color=colors["estimate"], width=2,
+                                                                 shape="hv" if method == "nearest" else "linear"),
+                                 hovertemplate=f"{labels[0]}: %{{x}}<br>{labels[1]}: %{{y}}"
+                                               "<extra>Estimated curve</extra>"))
         fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="Reference samples",
-                                 marker=dict(size=7, color="#0f766e")))
+                                 marker=dict(size=8, symbol="square", color=colors["sample"],
+                                             line=dict(color="white", width=1)),
+                                 hovertemplate=f"{labels[0]}: %{{x}}<br>{labels[1]}: %{{y}}"
+                                               "<extra>Known sample</extra>"))
         y_title = selected[1]
     else:
         xcol, ycol, zcol = selected
@@ -380,28 +461,49 @@ def make_chart(dimension, data, selected, out, method, outside, interpolator=Non
         gy = np.linspace(data[ycol].min(), data[ycol].max(), 55)
         mx, my = np.meshgrid(gx, gy)
         z = interpolator(mx.ravel(), my.ravel()).reshape(mx.shape)
-        fig.add_trace(go.Heatmap(x=gx, y=gy, z=z, colorscale="Teal", colorbar=dict(title=zcol),
-                                 hovertemplate="X: %{x}<br>Y: %{y}<br>Value: %{z}<extra></extra>"))
+        fig.add_trace(go.Heatmap(
+            x=gx, y=gy, z=z, name="Estimated display grid (55 × 55)", zsmooth=False,
+            colorscale=[[0, "#f0edff"], [0.5, "#a99bde"], [1, "#49378f"]],
+            colorbar=dict(title=dict(text=zcol, side="top"), orientation="h",
+                          y=1.08, yanchor="bottom", x=0, xanchor="left", len=1, thickness=12),
+            hovertemplate=f"{labels[0]}: %{{x}}<br>{labels[1]}: %{{y}}<br>{labels[2]}: %{{z}}"
+                          "<extra>Estimated display grid</extra>"))
         fig.add_trace(go.Scatter(x=data[xcol], y=data[ycol], mode="markers", name="Reference samples",
-                                 marker=dict(size=6, color="#172b4d", line=dict(color="white", width=1))))
+                                 customdata=data[[zcol]].to_numpy(),
+                                 marker=dict(size=8, symbol="square", color=colors["sample"],
+                                             line=dict(color="white", width=1)),
+                                 hovertemplate=f"{labels[0]}: %{{x}}<br>{labels[1]}: %{{y}}"
+                                               f"<br>{labels[2]}: %{{customdata[0]}}"
+                                               "<extra>Known sample</extra>"))
         y_title = ycol
     output_col = "yi" if dimension == "1d" else "zi"
-    for is_outside, name, color, symbol in [(False, "Interpolated queries", "#2563eb", "circle"),
-                                            (True, "Outside known data", "#b45309", "diamond")]:
+    for is_outside, name, color, symbol in [(False, "Interpolated queries", colors["query"], "circle"),
+                                            (True, "Outside known data", colors["outside"], "diamond")]:
         points = out[out["status"].str.startswith("Outside") == is_outside]
         if dimension == "1d":
             # Blank results have no Y position, so their status remains in the table.
             points = points[np.isfinite(points[output_col])]
         if not points.empty:
+            hover = (f"{labels[0]}: %{{x}}<br>{labels[1]}: %{{y}}" if dimension == "1d" else
+                     f"{labels[0]}: %{{x}}<br>{labels[1]}: %{{y}}<br>{labels[2]}: %{{customdata[0]}}")
             fig.add_trace(go.Scatter(x=points["xi"], y=points["yi"], mode="markers", name=name,
                                      customdata=points[[output_col, "status"]].to_numpy(),
-                                     hovertemplate="X: %{x}<br>Y: %{y}<br>Value: %{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+                                     hovertemplate=hover + "<br>%{customdata[1]}<extra></extra>",
                                      marker=dict(size=10, color=color, symbol=symbol,
                                                  line=dict(width=1, color="white"))))
-    fig.update_layout(xaxis_title=selected[0], yaxis_title=y_title, height=390,
-                      margin=dict(l=10, r=10, t=15, b=10),
-                      legend=dict(orientation="h", y=-0.23, x=0),
+    fig.update_layout(xaxis_title=selected[0], yaxis_title=y_title,
+                      height=480 if dimension == "2d" else 420,
+                      margin=dict(l=45, r=15, t=90 if dimension == "2d" else 15, b=125),
+                      # A single column of legend entries fits narrow screens and
+                      # cannot overlap the chart tools or query controls.
+                      legend=dict(orientation="v", y=-0.18, yanchor="top", x=0,
+                                  font=dict(size=12)),
+                      font=dict(family="Inter, system-ui, sans-serif", size=12, color=colors["sample"]),
+                      hoverlabel=dict(bgcolor="white", font_color=colors["sample"]),
+                      uirevision=f"{dimension}|{'|'.join(map(str, selected))}",
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig.update_xaxes(automargin=True, gridcolor=colors["grid"], zerolinecolor=colors["grid"])
+    fig.update_yaxes(automargin=True, gridcolor=colors["grid"], zerolinecolor=colors["grid"])
     return fig
 
 
@@ -427,6 +529,16 @@ def calculate(dimension, data, selected, query, method, outside, fingerprint):
     record = {"fingerprint": fingerprint, "data": out, "columns": selected,
               "method": actual_method, "outside": OUTSIDE[outside],
               "outside_count": int((~inside).sum()), "chart": None, "chart_error": None}
+    record["chart_note"] = (
+        "Squares are known samples; circles are queries within known data; diamonds mark outside-data queries. "
+        + ("The estimated surface is drawn on a 55 × 55 display grid, not additional measured data. "
+           "Query results are calculated at their exact coordinates."
+           if dimension == "2d" else
+           "The line shows nearest-sample steps." if method == "nearest" else
+           "The line joins known samples using linear interpolation.")
+    )
+    if dimension == "1d" and np.any(~np.isfinite(values)):
+        record["chart_note"] += " Blank results remain in the table and have no chart marker."
     try:
         record["chart"] = make_chart(dimension, data, selected, out, method, outside, interpolator)
     except (ValueError, RuntimeError):
@@ -438,21 +550,30 @@ def render_results(dimension, fingerprint):
     st.subheader("3. Inspect results")
     saved = st.session_state.get(f"result_{dimension}")
     if saved is None:
-        st.info("Ready when you are. Add your query points and select Calculate values.")
-        st.caption("Your results will include a chart, a table, and a CSV download.")
+        st.info("Ready when you are. Add your query points and select Calculate values.",
+                icon=":material/auto_graph:")
+        st.write("Your chart and calculated table will appear here.")
+        st.caption("Try the loaded example first. Then check each query's status and download all results.")
         return
     stale = saved["fingerprint"] != fingerprint
     if stale:
         st.warning("Inputs have changed. These are your previous results. Calculate again to update them.")
     else:
-        st.success(f"Calculated {len(saved['data']):,} query point(s).")
+        st.success(f"Calculated {len(saved['data']):,} query point(s). Results are current.")
+    st.write(f"Source: {saved.get('source_label', 'Previous reference data')}")
+    if saved.get("query_source"):
+        st.caption(f"Queries: {saved['query_source']}")
     st.caption(f"{saved['method']} · Outside known data: {saved['outside'].lower()}")
+    st.caption(" · ".join(f"{role}: {name}" for role, name in
+                          zip(["X", "Y", "Z"], saved["columns"])))
     if saved["outside_count"]:
         st.info(f"{saved['outside_count']:,} query point(s) outside the known data region. "
                 "Check the status column before using these results.")
     if saved["chart"] is not None:
         st.plotly_chart(saved["chart"], width="stretch", key=f"plot_{dimension}",
                         config={"scrollZoom": False, "displaylogo": False})
+        if saved.get("chart_note"):
+            st.caption(saved["chart_note"])
     if saved["chart_error"]:
         st.info(saved["chart_error"])
     columns = saved["columns"]
@@ -461,6 +582,9 @@ def render_results(dimension, fingerprint):
                      "status": st.column_config.TextColumn("Status")}
     if dimension == "2d":
         column_config["zi"] = st.column_config.NumberColumn(f"Z · {columns[2]}", format="%.6g")
+    st.markdown("**Calculated queries**")
+    st.caption(f"All {len(saved['data']):,} queries, in your original order. "
+               "The table displays six significant digits; downloads keep full numeric precision.")
     st.dataframe(saved["data"], hide_index=True, width="stretch", column_config=column_config)
     with st.expander("CSV download format"):
         left, right = st.columns(2)
@@ -473,13 +597,20 @@ def render_results(dimension, fingerprint):
         st.caption("Export settings change the downloaded file. Your calculated values stay the same. "
                    "UTF-8 encoding preserves column names and symbols in spreadsheets.")
         preview = result_csv(saved["data"].head(3), delimiter=delimiter, decimal=decimal)
+        st.caption("Format preview · first three queries only")
         st.code(preview.decode("utf-8-sig"), language="text")
-    csv_data = result_csv(saved["data"], delimiter=delimiter, decimal=decimal)
+    # One export buffer per result: cosmetic reruns do not repeatedly serialize a large table.
+    export_key = (delimiter, decimal)
+    if saved.get("export_format") != export_key:
+        saved["export_bytes"] = result_csv(saved["data"], delimiter=delimiter, decimal=decimal)
+        saved["export_format"] = export_key
+    csv_data = saved["export_bytes"]
     extension = "tsv" if delimiter == "\t" else "csv"
     st.download_button("Download results as CSV" if extension == "csv" else "Download results as TSV", csv_data,
                        file_name=f"interpolated_{dimension}.{extension}",
                        mime="text/tab-separated-values" if extension == "tsv" else "text/csv",
-                       disabled=stale, key=f"download_{dimension}", width="stretch")
+                       disabled=stale, key=f"download_{dimension}", width="stretch",
+                       icon=":material/download:", on_click="ignore")
     if stale:
         st.caption("Recalculate to enable the download for your current inputs.")
     else:
@@ -487,42 +618,61 @@ def render_results(dimension, fingerprint):
 
 
 def render_workflow(dimension):
-    with st.container(border=True):
-        source, data, selected = reference_inputs(dimension)
-    controls, results = st.columns([1, 1.5], gap="large")
+    controls, results = st.columns([1, 1.65], gap="large")
     with controls:
-        st.subheader("2. Choose what to estimate")
-        query, query_error = query_inputs(dimension, source)
-        method, outside = settings_inputs(dimension)
-        fingerprint = signature(source, data, selected, query, method, outside)
-        if query_error:
-            if query_error.startswith(("Enter ", "Choose ")):
-                st.caption(query_error)
-            else:
-                st.error(query_error)
-        elif query is not None:
-            st.caption(f"{len(query):,} query point(s) ready. Query order and duplicates are preserved.")
-        if data is None:
-            st.caption("Add valid reference data in step 1 to enable calculation.")
-        if st.button("Calculate values", type="primary", key=f"calculate_{dimension}",
-                     disabled=fingerprint is None, width="stretch"):
-            try:
-                with st.spinner("Calculating values…"):
-                    result = calculate(dimension, data, selected, query, method, outside, fingerprint)
-                st.session_state[f"result_{dimension}"] = result
-            except (ValueError, RuntimeError) as error:
-                st.error(f"Could not calculate values. {error}")
+        with st.container(border=True, key=f"controls_{dimension}"):
+            source, data, selected = reference_inputs(dimension)
+            st.divider()
+            st.subheader("2. Choose what to estimate")
+            query, query_error = query_inputs(dimension, source)
+            method, outside = settings_inputs(dimension)
+            fingerprint = signature(source, data, selected, query, method, outside)
+            if query_error:
+                if query_error.startswith(("Enter ", "Choose ")):
+                    st.info(query_error)
+                else:
+                    st.error(query_error)
+            elif query is not None:
+                st.caption(f"{len(query):,} query point(s) ready. Query order and duplicates are preserved.")
+            if data is None:
+                st.info("Add valid reference data in step 1 to enable calculation.")
+            if st.button("Calculate values", type="primary", key=f"calculate_{dimension}",
+                         disabled=fingerprint is None, width="stretch", icon=":material/calculate:"):
+                try:
+                    with st.spinner("Calculating values and preparing the chart…"):
+                        result = calculate(dimension, data, selected, query, method, outside, fingerprint)
+                    result["source_label"] = data.attrs.get("source_label", source)
+                    result["query_source"] = query.attrs.get("source_label", "Entered query points")
+                    result["reference_count"] = len(data)
+                    st.session_state[f"result_{dimension}"] = result
+                except (ValueError, RuntimeError) as error:
+                    st.error(f"Could not calculate values. {error} Your inputs are kept; correct them and try again.")
     with results:
-        render_results(dimension, fingerprint)
+        with st.container(border=True, key=f"results_{dimension}"):
+            render_results(dimension, fingerprint)
 
 
 def main():
     st.set_page_config(page_title="Interpolator", page_icon="📈", layout="wide")
-    add_buy_me_a_coffee()
     remember_inputs()
     st.markdown("""<style>
-        .block-container { max-width: 1440px; padding-top: 2rem; }
+        :root { --workspace-surface: #fff; --workspace-muted: #626b80;
+                --workspace-focus: #6251c6; }
+        .block-container { max-width: 1440px; padding-top: 2rem; padding-bottom: 2rem; }
         h1 { letter-spacing: -0.035em; }
+        .st-key-controls_1d, .st-key-controls_2d,
+        .st-key-results_1d, .st-key-results_2d { background: var(--workspace-surface); }
+        [data-testid="stCaptionContainer"] { color: var(--workspace-muted); font-size: 0.94rem; }
+        :focus-visible { outline: 2px solid var(--workspace-focus); outline-offset: 3px; }
+        @media (max-width: 640px) {
+            .block-container { padding-left: 1rem; padding-right: 1rem; }
+            h1 { font-size: 2rem; }
+            button { min-height: 44px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { scroll-behavior: auto !important;
+                animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+        }
     </style>""", unsafe_allow_html=True)
     st.title("Interpolator")
     st.write("Estimate values between known data points.")
@@ -532,6 +682,16 @@ def main():
         render_workflow("1d")
     with tab2:
         render_workflow("2d")
+    st.divider()
+    st.caption("Inputs, settings, and results are kept in this server session. Download results to keep them.")
+    with st.expander("Session & privacy"):
+        st.write("Uploaded files and pasted data are sent to the Streamlit server for processing. "
+                 "They are retained in the active session, including when you switch sources or modes. "
+                 "Use Clear uploaded file to remove a retained upload. Previous calculated results stay "
+                 "visible and are marked as needing an update.")
+        st.write("Settings are not saved as a portable setup. A browser refresh, disconnection, or server "
+                 "restart may reset the session. Download any results you want to keep.")
+    add_buy_me_a_coffee()
 
 
 if __name__ == "__main__":

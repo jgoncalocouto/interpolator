@@ -167,6 +167,35 @@ class CalculationPresentationTests(unittest.TestCase):
                 self.assertEqual(y[np.flatnonzero(x == midpoint)[0]], left_y)
                 self.assertEqual(y[np.flatnonzero(x == np.nextafter(midpoint, np.inf))[0]], right_y)
 
+    def test_surface_distinguishes_display_grid_from_exact_queries_and_known_samples(self):
+        query = pd.DataFrame({"xi": [0.123456789, 0.876543211], "yi": [0.234567891, 0.345678912]})
+        record = main.calculate("2d", self.surface, list(self.surface.columns), query,
+                                "nearest", "nan", "nearest-surface")
+        heatmap = record["chart"].data[0]
+        self.assertFalse(heatmap.zsmooth)
+        self.assertEqual(np.asarray(heatmap.z).shape, (55, 55))
+        self.assertIn("55 × 55 display grid", record["chart_note"])
+        self.assertIn("exact coordinates", record["chart_note"])
+        np.testing.assert_array_equal(record["data"]["xi"], query["xi"])
+        np.testing.assert_array_equal(record["data"]["yi"], query["yi"])
+        grid_values = np.asarray(heatmap.z, dtype=float)
+        self.assertTrue(set(grid_values[np.isfinite(grid_values)]) <= set(self.surface["Elevation"]))
+        traces = {trace.name: trace for trace in record["chart"].data}
+        self.assertEqual(traces["Reference samples"].marker.symbol, "square")
+        self.assertNotEqual(traces["Reference samples"].marker.symbol,
+                            traces["Interpolated queries"].marker.symbol)
+        np.testing.assert_array_equal(traces["Reference samples"].customdata[:, 0],
+                                      self.surface["Elevation"])
+        self.assertIn("Elevation", traces["Reference samples"].hovertemplate)
+
+    def test_blank_curve_results_have_an_explicit_chart_explanation(self):
+        record = main.calculate("1d", self.curve, list(self.curve.columns),
+                                pd.DataFrame({"xi": [-1.0, 0.5]}), "linear", "nan", "blank-note")
+        self.assertIn("Blank results remain in the table", record["chart_note"])
+        nearest = main.calculate("1d", self.curve, list(self.curve.columns),
+                                 pd.DataFrame({"xi": [0.5]}), "nearest", "nan", "nearest-note")
+        self.assertIn("nearest-sample steps", nearest["chart_note"])
+
 
 class UploadIngestionTests(unittest.TestCase):
     """Exercise the real UploadedFile boundary unavailable to AppTest."""

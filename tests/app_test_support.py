@@ -1,6 +1,7 @@
 """Shared Streamlit fixtures and assertions, without inherited test methods."""
 
 from contextlib import contextmanager
+import json
 import logging
 from pathlib import Path
 import unittest
@@ -11,6 +12,28 @@ from streamlit.testing.v1 import AppTest
 
 
 APP = Path(__file__).resolve().parents[1] / "main.py"
+
+
+class ColumnPickerState:
+    """Exercise picker-backed workflow state without simulating browser keys.
+
+    AppTest does not execute custom-component JavaScript. Browser checks cover
+    the search popup and its keyboard behavior; this adapter covers the same
+    scalar mapping state used by the calculation workflow.
+    """
+
+    def __init__(self, app, key, options):
+        self.app, self.key, self.options = app, key, options
+
+    @property
+    def value(self):
+        return self.app.session_state[self.key]
+
+    def set_value(self, value):
+        if value not in self.options:
+            raise ValueError(f"{value!r} is not an available column.")
+        self.app.session_state[self.key] = value
+        return self.app
 
 
 class AppTestCase(unittest.TestCase):
@@ -32,13 +55,20 @@ class AppTestCase(unittest.TestCase):
                     if element.proto.id.endswith(f"-download_{dimension}"))
 
     def reference_column(self, dimension, index):
-        return next(element for element in self.app.selectbox
-                    if element.key.startswith(f"input_column_{dimension}_")
-                    and element.key.endswith(f"_{index}"))
+        return self.column_picker(lambda key: key.startswith(f"input_column_{dimension}_")
+                                  and key.endswith(f"_{index}"))
 
     def query_column(self, axis):
-        return next(element for element in self.app.selectbox
-                    if element.key.startswith(f"input_query_{axis}_2d"))
+        return self.column_picker(lambda key: key.startswith(f"input_query_{axis}_2d"))
+
+    def column_picker(self, matches):
+        for element in self.app.get("bidi_component"):
+            key = element.proto.id.partition("-picker_")[2]
+            if key and matches(key):
+                return ColumnPickerState(self.app, key, json.loads(element.proto.json)["options"])
+        # Retain compatibility with native controls while component integration
+        # is tested against supported Streamlit versions.
+        return next(element for element in self.app.selectbox if matches(element.key))
 
     def import_setting(self, context, name):
         return self.app.selectbox(key=f"input_format_{context}_{name}")

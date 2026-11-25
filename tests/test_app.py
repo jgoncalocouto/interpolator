@@ -198,7 +198,7 @@ class WorkflowTests(AppTestCase):
         self.import_setting(context, "delimiter").set_value(";").run()
         self.assert_no_exception()
         self.assertFalse(self.app.button(key="calculate_1d").disabled)
-        self.assertTrue(any("Read as:" in item.value for item in self.app.caption))
+        self.assertTrue(any("Read as:" in item.value for item in self.app.markdown))
         self.app.button(key="calculate_1d").click().run()
         self.assertEqual(self.app.session_state["result_1d"]["data"]["yi"].iloc[0], 1)
 

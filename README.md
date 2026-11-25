@@ -28,12 +28,31 @@ Open the local URL printed by Streamlit. On macOS/Linux, use
    query order, duplicate queries, and full numeric precision
    (`xi, yi, status` or `xi, yi, zi, status`).
 
+Each mode keeps its own inputs and results. On wide screens, data and calculation
+controls share the left panel and results have the larger right panel. The panels
+stack on narrow screens. Import overrides, detailed previews, and method guidance
+expand on demand.
+
+Every reference and 2D query column selector includes **Search columns**. Search
+matches partial names and multiple words, ignoring case and accents while keeping
+the original column labels. Use the arrow keys and Enter to choose, or Escape to
+close the picker without changing the selection. A search with no matches leaves
+the current mapping intact.
+
 Results stay available across interactions. Changing calculation inputs marks
 the previous results and disables their download until you calculate again.
+Results identify the reference source, selected columns, method, and outside-data
+policy that produced them. Replacing a source file or changing its import
+interpretation requires recalculation even when the prepared numeric values
+happen to match.
 Pasted text, column selections, uploaded files, and results are retained within
 the active Streamlit session. A browser refresh or server restart can reset that
 session; download results you want to keep. Use **Clear uploaded file** to remove
-a retained upload from the current session.
+a retained upload from the current session. Uploaded and pasted data are
+processed by the Streamlit server: on your computer when running locally, or on
+the hosting server when using a deployed app. Uploads are not confined to the
+browser. Retaining a setup in this session does not save a portable settings
+file.
 
 ## Importing tables
 
@@ -55,7 +74,7 @@ it, and use a different character for the decimal separator. For example,
 semicolon-separated cells containing `1.234,50` need **Decimal separator: Comma**
 and **Thousands separator: Point** to read as `1234.5`.
 
-**Check how your numbers are read** compares the first five original data rows
+Expand **Check how your numbers are read** to compare the first five original data rows
 with the numbers used for calculation, before exclusions or duplicate averaging.
 Numeric previews use decimal points. Check the scale of your values, not just
 whether they appear numeric: `1,234` can mean different values in different
@@ -84,8 +103,9 @@ let you verify its assumptions.
 ## Download format
 
 Open **CSV download format** beside the results to choose comma, semicolon, tab,
-or pipe columns, and either decimal points or decimal commas. A short text
-preview shows exactly how the file will be written. The default is comma columns
+or pipe columns, and either decimal points or decimal commas. A labeled preview
+of the first three queries shows how the file will be written; the download
+contains every query. The default is comma columns
 with decimal points; semicolon columns with decimal commas suit many European
 spreadsheet configurations. Values are quoted when needed, and no thousands
 grouping is added.
@@ -111,6 +131,19 @@ nearest samples use the supplied coordinate units; the RBF fit scales its axes.
 
 Outside-data results have explicit statuses in the table and CSV. Blank is the
 default because extending beyond known data requires an additional assumption.
+
+## Reading the chart
+
+Squares mark known samples, circles mark queries within the known data region,
+and diamonds mark outside-data queries. Hover labels use the selected source
+column names and units. In 1D, a linear method draws straight segments and a
+nearest-sample method draws steps. Blank results remain in the table; a blank
+1D value cannot have a chart marker.
+
+The 2D estimated surface is displayed on a **55 × 55 grid**. These grid cells
+are a visualization, not additional measured samples. Every requested query is
+calculated at its exact coordinates; the display grid does not limit query
+precision or exports. Nearest-sample surfaces use unsmoothed cells.
 
 ## Verify changes
 

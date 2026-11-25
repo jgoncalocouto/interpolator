@@ -5,6 +5,7 @@ source =
     main
     interpolation
     coffee_widget
+    column_picker
 
 [report]
 show_missing = True
