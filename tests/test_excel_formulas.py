@@ -11,7 +11,7 @@ import unittest
 
 import numpy as np
 
-from excel_formulas import build_linear_formula, parse_vector_reference
+from excel_formulas import build_compact_formula, build_linear_formula, parse_vector_reference
 
 
 class ExcelError(Exception):
@@ -267,6 +267,172 @@ class FormulaEvaluator:
     def assert_name(expression):
         if expression[0] != "name":
             raise AssertionError(f"Invalid LET/LAMBDA variable: {expression}")
+
+
+class CompactFormulaEvaluator(FormulaEvaluator):
+    """Model vector XLOOKUP and per-cell errors without changing guarded tests.
+
+    Error values can be held in LET variables and masked by the selected IF
+    branch. That matters at exact samples (the unused arithmetic branch is 0/0)
+    and outside the source range (one bracketing lookup has no match).
+    """
+
+    @staticmethod
+    def per_cell(function, *values):
+        arrays = np.broadcast_arrays(*[_grid(value) for value in values])
+        result = np.empty(arrays[0].shape, dtype=object)
+        for position in np.ndindex(result.shape):
+            arguments = [array[position] for array in arrays]
+            error = next((value for value in arguments if isinstance(value, ExcelError)), None)
+            if error is not None:
+                result[position] = error
+            else:
+                try:
+                    result[position] = function(*arguments)
+                except ZeroDivisionError:
+                    result[position] = ExcelError("#DIV/0!")
+        return result
+
+    def node(self, expression, environment):
+        kind = expression[0]
+        if kind == "binary":
+            left, right = (self.node(item, environment) for item in expression[2:])
+            operations = {
+                "+": lambda a, b: a + b, "-": lambda a, b: a - b,
+                "*": lambda a, b: a * b, "/": lambda a, b: a / b,
+                "=": lambda a, b: a == b,
+            }
+            return self.per_cell(operations[expression[1]], left, right)
+        if kind != "call":
+            return super().node(expression, environment)
+        _, function, arguments = expression
+        if function == "LET":
+            local = environment.copy()
+            for index in range(0, len(arguments) - 1, 2):
+                self.assert_name(arguments[index])
+                try:
+                    value = self.node(arguments[index + 1], local)
+                except ExcelError as error:
+                    value = error
+                local[arguments[index][1]] = value
+            return self.node(arguments[-1], local)
+        if function == "IF":
+            condition = self.node(arguments[0], environment)
+            branches = []
+            for argument in arguments[1:]:
+                try:
+                    branches.append(self.node(argument, environment))
+                except ExcelError as error:
+                    branches.append(error)
+            arrays = np.broadcast_arrays(_grid(condition), *[_grid(value) for value in branches])
+            result = np.empty(arrays[0].shape, dtype=object)
+            for position in np.ndindex(result.shape):
+                flag = arrays[0][position]
+                result[position] = (flag if isinstance(flag, ExcelError) else
+                                    arrays[1 if flag else 2][position])
+            return result
+        if function == "TRANSPOSE":
+            return _grid(self.node(arguments[0], environment)).T
+        if function == "XLOOKUP":
+            queries, lookup, returned = [self.node(item, environment) for item in arguments[:3]]
+            if lookup.shape != returned.shape:
+                raise ExcelError("#VALUE!")
+            mode = int(self.node(arguments[4], environment)) if len(arguments) > 4 else 0
+            options, answers = list(lookup.flat), list(returned.flat)
+            result = np.empty(_grid(queries).shape, dtype=object)
+            for position in np.ndindex(result.shape):
+                query = _grid(queries)[position]
+                # Compact mode intentionally assumes numeric, nonblank queries.
+                query = 0 if query is None else query
+                if isinstance(query, ExcelError):
+                    result[position] = query
+                    continue
+                if query in options:
+                    selected = query
+                else:
+                    candidates = [value for value in options
+                                  if (mode == -1 and value < query) or (mode == 1 and value > query)]
+                    selected = (max(candidates) if mode == -1 else min(candidates)) if candidates else None
+                if selected is None:
+                    try:
+                        result[position] = self.node(arguments[3], environment)
+                    except ExcelError as error:
+                        result[position] = error
+                else:
+                    result[position] = answers[options.index(selected)]
+            return result
+        return super().node(expression, environment)
+
+
+class GeneratedCompactFormulaTests(unittest.TestCase):
+    def calculate(self, x, y, queries, *, x_reference="$A$2:$A$7", y_reference="$B$2:$B$7",
+                  query_reference="D2:D13", separator=","):
+        formula = build_compact_formula(x_reference, y_reference, query_reference, separator=separator)
+        actual = CompactFormulaEvaluator({x_reference: x, y_reference: y,
+                                          query_reference: queries}).evaluate(formula)
+        return formula, actual
+
+    def assert_values(self, actual, expected):
+        self.assertIsInstance(actual, np.ndarray, actual)
+        self.assertEqual(actual.size, len(expected))
+        for position, (value, target) in enumerate(zip(actual.flat, expected)):
+            with self.subTest(position=position):
+                if target == "#N/A":
+                    self.assertIsInstance(value, ExcelError)
+                    self.assertEqual(value.code, "#N/A")
+                else:
+                    self.assertAlmostEqual(value, target, places=12)
+
+    def test_native_excel_verified_sample_spills_all_queries_in_original_order(self):
+        x, y = [[6], [0], [10], [4], [2], [8]], [[35], [18], [42], [28], [22], [39]]
+        queries = [[value] for value in [0, 1, 2, 3, 4, 7, 10, 12, -2, 3, 8, 9]]
+        for separator in (",", ";"):
+            with self.subTest(separator=separator):
+                _, actual = self.calculate(x, y, queries, separator=separator)
+                self.assertEqual(actual.shape, (12, 1))
+                self.assert_values(actual, [18, 20, 22, 25, 28, 37, 42, "#N/A", "#N/A", 25, 39, 40.5])
+
+    def test_exact_knots_preserve_tiny_measurements_without_division_errors(self):
+        measured = [1e16, 1e-12, -1e12]
+        _, actual = self.calculate([[0.1], [0.3], [0.9]], [[value] for value in measured],
+                                   [[0.1], [0.3], [0.9]], x_reference="A2:A4",
+                                   y_reference="B2:B4", query_reference="D2:D4")
+        self.assertEqual(list(actual.flat), measured)
+
+    def test_source_orientations_and_horizontal_query_order_are_preserved(self):
+        for x, y, x_ref, y_ref in (
+                ([[0, 2, 4]], [[10, 20, 60]], "A2:C2", "A4:C4"),
+                ([[0, 2, 4]], [[10], [20], [60]], "A2:C2", "A4:A6"),
+                ([[0], [2], [4]], [[10, 20, 60]], "A2:A4", "C2:E2")):
+            with self.subTest(x_reference=x_ref, y_reference=y_ref):
+                _, actual = self.calculate(x, y, [[1, 3, 1, 4]], x_reference=x_ref,
+                                           y_reference=y_ref, query_reference="G2:J2")
+                self.assertEqual(actual.shape, (1, 4))
+                self.assert_values(actual, [15, 40, 15, 60])
+
+    def test_single_query_and_query_edits_recalculate_piecewise_values(self):
+        for query, expected in ((1, 20), (1.5, 21), (3, 25), (-2, "#N/A"), (12, "#N/A")):
+            with self.subTest(query=query):
+                _, actual = self.calculate([[0], [2], [4]], [[18], [22], [28]], [[query]],
+                                           x_reference="A2:A4", y_reference="B2:B4", query_reference="D2")
+                self.assert_values(actual, [expected])
+
+    def test_semicolon_arguments_keep_quoted_sheet_punctuation_intact(self):
+        reference = "'Sensor, O''Brien'!$A$2:$A$4"
+        formula, actual = self.calculate([[0], [2], [4]], [[10], [20], [60]], [[1], [3]],
+                                         x_reference=reference, y_reference="'Other; sheet'!$B$2:$B$4",
+                                         query_reference="'Queries!'!D2:D3", separator=";")
+        self.assertIn(reference, formula)
+        self.assert_values(actual, [15, 40])
+
+    def test_compact_ranges_and_separator_are_validated_before_formula_output(self):
+        for args, kwargs in (
+                (("A2", "B2", "D2"), {}),
+                (("A2:A7", "B2:B6", "D2"), {}),
+                (("A2:B7", "B2:B7", "D2"), {}),
+                (("A2:A7", "B2:B7", "D2"), {"separator": "|"})):
+            with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
+                build_compact_formula(*args, **kwargs)
 
 
 class GeneratedLinearFormulaTests(unittest.TestCase):

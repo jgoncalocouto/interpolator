@@ -35,11 +35,12 @@ and branches in `main.py`, `interpolation.py`, `coffee_widget.py`,
 Generated reports are ignored by Git. Coverage is a regression guard; the
 numerical assertions and workflow checks establish the behavior.
 
-Verified on 25 November 2026 with the local Python 3.15.2 environment: all 159
+Verified on 25 November 2026 with the local Python 3.15.2 environment: all 167
 Python tests and all seven Node tests passed. Combined statement-and-branch
-coverage was 96.7%, above the 90% gate. The Excel formula generator and tips
-workflow each reached 100% statement-and-branch coverage. These results cover the automated
-contracts above; the browser checks below remain separate.
+coverage was 96.8%, above the 90% gate. The Excel formula generator and tips
+workflow each reached 100% statement-and-branch coverage. These results cover
+the automated contracts above; native Excel and browser checks are described
+separately below.
 
 On macOS/Linux, use `.venv/bin/python` in place of
 `.\.venv\Scripts\python.exe`.
@@ -63,7 +64,7 @@ On macOS/Linux, use `.venv/bin/python` in place of
 | Example data | Usable example workflows and downloadable example contents | `test_app.py`, `test_app_features.py` |
 | CSV/TSV downloads | Every offered separator/decimal combination, quoting, Unicode/BOM, precision, missing values, statuses, filenames, MIME types, and unchanged numerical results when export settings change | `test_interpolation.py`, `test_core_features.py`, `test_app.py`, `test_app_features.py` |
 | Coffee support widget | Default/custom link and title, escaped attribute content, and safe new-tab attributes | `test_presentation.py` |
-| Excel formula generator | A1 reference validation, source guards, paired sorting, exact knots, vector orientation, query order, separator/policy variants, and independence from calculation state | `test_excel_formulas.py`, `test_tips.py` |
+| Excel formula generator | Compact and guarded styles, A1 reference validation, guarded source checks and sorting, exact knots, vector orientation, query order, separators, outside-range behavior, and independence from calculation state | `test_excel_formulas.py`, `test_tips.py` |
 
 All test paths above are under `tests/`. `app_test_support.py` contains common
 fixtures and assertions without test methods, so sharing setup does not run
@@ -90,11 +91,26 @@ browser checks.
 Excel formula tests parse and evaluate the emitted expression using a small,
 independent evaluator for the functions used by this generator. Numerical
 results are checked against independently specified expected values, including
-nonlinear source data and exact sample boundaries. This catches formula-expression
-errors beyond text snapshots; it does not execute Microsoft Excel or establish
-native-engine compatibility. Native
-Excel pasting, formula localization, dynamic-array spill behavior, and workbook
-error reporting remain manual checks.
+nonlinear source data and exact sample boundaries. These tests catch expression
+errors beyond text snapshots; the automated suite does not execute Microsoft
+Excel or establish native-engine compatibility.
+
+A separate desktop Excel check on 25 November 2026 verified the compact formula
+in `examples/linear_interpolation_test.xlsx`. One formula in E6 spilled through
+E17 and matched all 12 expected results for unsorted source pairs, exact samples,
+both endpoints, repeated queries, intermediate values, and two outside-range
+`#N/A` results. Changing a query from 1 to 1.5 changed Yi from 20 to 21. Changing
+the measured Y at X = 2 from 22 to 26 changed the query at X = 1 to 22 and the
+exact query at X = 2 to 26. Original inputs were restored and the saved workbook's
+cached results and spill range were inspected. The downloadable workbook retains
+those native Excel results and formulas.
+
+The workbook-generation engine returned `#VALUE!` for approximate `XLOOKUP`
+calls while desktop Excel calculated the formula correctly. Its engine results
+were not accepted as passing or substituted for native verification. Guarded
+formulas in native Excel, horizontal and mixed-orientation compact formulas,
+pasting from the website, localized functions, and other Excel versions remain
+separate manual checks.
 
 Upload tests use real uploaded-file objects at the handler boundary,
 cached records for portable workflow coverage, and direct file-widget input
@@ -115,11 +131,15 @@ Before a release, manually check:
    in the target spreadsheet application with point and comma decimal settings.
 4. Chart hover/zoom behavior, preservation of zoom after format-only edits,
    marker shapes, 55 × 55 derived-grid disclosure, and outside-data/blank results.
-5. Copy a generated Excel formula into Microsoft 365 or Excel 2024. Check
-   single and multiple queries, row and column orientation, exact samples,
-   each outside policy, blank/invalid cells, duplicate-X rejection, and both
-   supported argument separators. Confirm the result spills into empty cells
-   and that source/query ranges are not overwritten.
+5. Copy a compact formula into Excel 2021, Excel 2024, or Microsoft 365. Check
+   single and multiple queries, row/column and mixed source orientations,
+   exact samples, outside-range `#N/A`, and both argument separators. Try the
+   downloadable example separately; its formula is in E6 and its query range is
+   D6:D17. Confirm results spill into empty cells without overwriting inputs.
+6. In Microsoft 365 or Excel 2024, check the guarded style's outside policies,
+   blank/invalid cells, duplicate-X rejection, and recovery. Changing styles or
+   generator settings must preserve results and downloads in both calculation
+   tabs.
 
 No automated coverage percentage establishes accessibility, screen-reader
 behavior, responsive layout, or compatibility with every spreadsheet locale.

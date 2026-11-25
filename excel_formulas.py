@@ -1,7 +1,7 @@
-"""Generate guarded piecewise-linear formulas using modern Excel functions.
+"""Generate compact and guarded piecewise-linear Excel formulas.
 
-References are bounded A1 vectors in the current workbook. No workbook data is
-read here: Excel validates source contents when the generated formula runs.
+References are bounded A1 vectors in the current workbook. Workbook data is
+never read here; only the guarded formula validates its cell contents in Excel.
 """
 
 from dataclasses import dataclass
@@ -20,6 +20,7 @@ _CELL = re.compile(r"(?P<column>\$?[A-Za-z]{1,3})(?P<row>\$?[0-9]+)")
 class VectorReference:
     reference: str
     length: int
+    horizontal: bool = False
 
 
 def parse_vector_reference(value, label="Range"):
@@ -58,15 +59,12 @@ def parse_vector_reference(value, label="Range"):
     reference = (f"{sheet}!" if sheet else "") + cells[0]
     if match["last"]:
         reference += ":" + cells[1]
-    return VectorReference(reference, length)
+    return VectorReference(reference, length, first_row == last_row)
 
 
-def build_linear_formula(x_reference, y_reference, query_reference, *, separator=",", outside="nan"):
-    """Return a single-line, copyable formula; errors never become fake zeros."""
+def _formula_references(x_reference, y_reference, query_reference, separator):
     if separator not in (",", ";"):
         raise ValueError("Choose a comma or semicolon between Excel function arguments.")
-    if outside not in ("nan", "clamp", "linear"):
-        raise ValueError("Choose leave blank, keep boundary value, or extend end slopes.")
     x = parse_vector_reference(x_reference, "X range")
     y = parse_vector_reference(y_reference, "Y range")
     query = parse_vector_reference(query_reference, "Xi cell or range")
@@ -74,6 +72,36 @@ def build_linear_formula(x_reference, y_reference, query_reference, *, separator
         raise ValueError("X and Y each need at least two cells containing known points.")
     if x.length != y.length:
         raise ValueError(f"X has {x.length} cells and Y has {y.length}. Choose ranges of equal length.")
+    return x, y, query
+
+
+def build_compact_formula(x_reference, y_reference, query_reference, *, separator=","):
+    """Use the native-Excel-tested core; valid numeric, unique-X data is assumed.
+
+    XLOOKUP's next-smaller/larger matches work with unsorted data. Queries
+    outside the sample range retain #N/A; workbook contents are not validated.
+    """
+    x, y, query = _formula_references(x_reference, y_reference, query_reference, separator)
+
+    def function(name, *arguments):
+        return f"{name}({separator.join(arguments)})"
+
+    y_values = function("TRANSPOSE", y.reference) if x.horizontal != y.horizontal else y.reference
+    return "=" + function(
+        "LET", "x", x.reference, "y", y_values, "q", query.reference,
+        "a", function("XLOOKUP", "q", "x", "x", "NA()", "-1"),
+        "b", function("XLOOKUP", "q", "x", "x", "NA()", "1"),
+        "u", function("XLOOKUP", "q", "x", "y", "NA()", "-1"),
+        "v", function("XLOOKUP", "q", "x", "y", "NA()", "1"),
+        function("IF", "a=b", "u", "u+(q-a)/(b-a)*(v-u)"),
+    )
+
+
+def build_linear_formula(x_reference, y_reference, query_reference, *, separator=",", outside="nan"):
+    """Return the guarded version with sorting, validation, and outside policies."""
+    if outside not in ("nan", "clamp", "linear"):
+        raise ValueError("Choose leave blank, keep boundary value, or extend end slopes.")
+    x, y, query = _formula_references(x_reference, y_reference, query_reference, separator)
 
     def function(name, *arguments):
         return f"{name}({separator.join(arguments)})"

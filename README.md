@@ -158,24 +158,42 @@ ranges. A query range spills Y results in the same orientation and original
 order. Leave enough empty cells for that spill. Use `$` anchors on known-data
 ranges when copying a single-query formula down.
 
-The formula uses English function names and requires **Microsoft 365 or Excel
-2024** with dynamic arrays. Choose comma or semicolon argument separators to
-match your Excel settings. Localized Excel installations may also require
-translated function names. This first version accepts row or column vectors,
+**Compact** is the default formula style. It uses `LET` and `XLOOKUP` and works
+with **Excel 2021, Excel 2024, or Microsoft 365**. Known X values do not need to
+be sorted. Exact sample coordinates return their known Y; queries below the
+smallest X or above the largest X return `#N/A`, without extrapolation.
+
+Compact formulas assume valid data: use equal-length X/Y ranges with at least
+two numeric samples, unique X values, and numeric query cells. Exclude headers,
+blanks, logical values, and numbers stored as text. The compact formula does not
+validate those assumptions; Excel can interpret blank cells as zero. Average
+repeated measurements before using it.
+
+Choose **Guarded** when you need the longer formula's checks and outside-range
+options. It requires **Microsoft 365 or Excel 2024** and uses `MAP` and `TOCOL`.
+It sorts paired samples together, rejects nonnumeric source cells and duplicate
+X values with `#N/A`, leaves empty query cells blank, and rejects other invalid
+queries. Its outside policies are **Leave blank**, **Keep boundary value**, and
+**Extend end slopes**.
+
+Both styles use English function names. Choose comma or semicolon argument
+separators to match your Excel settings; localized installations may also need
+translated function names. Row and column vectors are supported, including X/Y
+vectors with different orientations. This version accepts bounded A1 references,
 rather than named ranges, table references, or 2D interpolation.
 
-- X and Y must contain the same number of cells, with at least two numeric
-  points. Exclude headers, empty source cells, and numbers stored as text.
-- X/Y pairs are sorted together inside the formula. X values must be unique;
-  average repeated measurements before using this Excel formula. Invalid
-  reference data returns `#N/A` rather than being silently excluded or changed.
-- Empty query cells stay blank. Other nonnumeric query values return `#N/A`.
-- Outside the known X range, choose **Leave blank**, **Keep boundary value**,
-  or **Extend end slopes**. Exact sample coordinates return their known Y.
+The **Try a worked example** section also offers a [test workbook](examples/linear_interpolation_test.xlsx)
+verified in desktop Excel. Its own layout puts known data in A6:B11, queries in
+D6:D17, and one compact formula in E6 that spills through E17. The workbook
+contains expected results and comparisons for 12 cases, including the two
+expected outside-range `#N/A` results. Its references differ from the default
+inline example's A2/B2/D2 layout.
 
 The formula uses the two neighboring samples for each query. Applying
 `FORECAST.LINEAR` to all source samples instead fits a regression line and can
 give different values between samples. See Microsoft's documentation for
+[XLOOKUP](https://support.microsoft.com/en-us/excel/functions/xlookup-function),
+[LET](https://support.microsoft.com/en-us/excel/functions/let-function),
 [MAP](https://support.microsoft.com/en-us/excel/functions/map-function),
 [TOCOL](https://support.microsoft.com/en-us/excel/functions/tocol-function),
 and [FORECAST.LINEAR](https://support.microsoft.com/en-us/excel/functions/forecast-and-forecast-linear-functions).

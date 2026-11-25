@@ -37,6 +37,7 @@ representative users or a claim of full accessibility compliance.
 | A replacement upload with the same prepared values could leave a previous result looking current. | Calculation freshness includes original source contents, filename, parsing options, mappings, queries, method, and policy. Previous results identify their saved source and mappings and keep downloads disabled until recalculation. | Trustworthy result provenance |
 | Cosmetic interactions repeatedly parsed data and serialized full exports. | Session-local caches retain the latest parsed/prepared data for each workflow and one export buffer per result; dependency changes invalidate the relevant cache without accumulating result history. | Responsive interaction and bounded memory |
 | Session retention could be mistaken for saved settings or browser-only processing. | The footer and Session & privacy disclosure identify Streamlit server processing, session-limited retention, explicit upload clearing, and the absence of a portable saved setup. | Accurate privacy and recovery communication |
+| The first Excel formula buried the interpolation in validation and preparation logic. | Compact is now the default, with numeric-data assumptions and outside-range `#N/A` behavior visible; the guarded version remains an explicit option with its own requirements and policies. A downloadable worked example carries native Excel test results. | Progressive disclosure and analytical honesty |
 
 ## Validation and limits
 
@@ -83,7 +84,12 @@ representative users or a claim of full accessibility compliance.
   by the intended audience also needs manual validation.
 - The later Tips & tricks tab adds an independent 1D Excel formula generator.
   Tests evaluate its emitted expressions and exercise range validation and app
-  state. Native Excel calculation, formula clipboard behavior, and localized
-  installations remain unverified. See TESTING.md for the current suite results.
+  state. The compact LET/XLOOKUP formula was separately verified in desktop Excel
+  on 12 cases, including a spilled query range and recalculation after query and
+  reference edits. Compact assumes numeric, nonblank data and unique X values;
+  it does not silently gain the guarded style's validation or outside policies.
+  Guarded formulas in native Excel, mixed source orientations, website clipboard
+  behavior, and localized installations remain unverified. See TESTING.md for
+  the current suite results and the precise native check scope.
 - A useful next validation is to watch a few representative users import their
   own data, identify an outside-data query, and export a result without assistance.
