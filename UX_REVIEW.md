@@ -65,7 +65,7 @@ representative users or a claim of full accessibility compliance.
   coordinates, known-sample payloads, display-grid disclosure, and explanations
   for blank 1D markers. The same tests preserve method, outside-region, and
   chart-failure recovery contracts.
-- Verification on 25 November 2026 passed all 140 Python tests and seven Node
+- Initial UI-review verification on 25 November 2026 passed all 140 Python tests and seven Node
   tests, with 96.3% combined statement-and-branch coverage. Picker tests cover
   matching, registered callbacks, simulated keyboard/focus behavior, listener
   cleanup, and popup geometry within a 390 px viewport. These simulated checks
@@ -81,5 +81,9 @@ representative users or a claim of full accessibility compliance.
   hover/zoom, screen readers, and browser downloads remain unverified.
 - Opening each export format in the spreadsheet applications and locales used
   by the intended audience also needs manual validation.
+- The later Tips & tricks tab adds an independent 1D Excel formula generator.
+  Tests evaluate its emitted expressions and exercise range validation and app
+  state. Native Excel calculation, formula clipboard behavior, and localized
+  installations remain unverified. See TESTING.md for the current suite results.
 - A useful next validation is to watch a few representative users import their
   own data, identify an outside-data query, and export a result without assistance.

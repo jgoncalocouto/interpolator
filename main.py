@@ -10,6 +10,7 @@ import streamlit as st
 
 from coffee_widget import add_buy_me_a_coffee
 from column_picker import select_column
+from tips import render_tips
 from interpolation import (
     build_forward_interpolator,
     interp_linear,
@@ -661,7 +662,8 @@ def main():
         .block-container { max-width: 1440px; padding-top: 2rem; padding-bottom: 2rem; }
         h1 { letter-spacing: -0.035em; }
         .st-key-controls_1d, .st-key-controls_2d,
-        .st-key-results_1d, .st-key-results_2d { background: var(--workspace-surface); }
+        .st-key-results_1d, .st-key-results_2d,
+        .st-key-excel_controls, .st-key-excel_formula { background: var(--workspace-surface); }
         [data-testid="stCaptionContainer"] { color: var(--workspace-muted); font-size: 0.94rem; }
         :focus-visible { outline: 2px solid var(--workspace-focus); outline-offset: 3px; }
         @media (max-width: 640px) {
@@ -677,11 +679,13 @@ def main():
     st.title("Interpolator")
     st.write("Estimate values between known data points.")
     st.caption("Add known data → Choose query points → Inspect and download results")
-    tab1, tab2 = st.tabs(["1D · Find Y from X", "2D · Find Z from X and Y"])
+    tab1, tab2, tips_tab = st.tabs(["1D · X → Y", "2D · X, Y → Z", "Tips & tricks"])
     with tab1:
         render_workflow("1d")
     with tab2:
         render_workflow("2d")
+    with tips_tab:
+        render_tips()
     st.divider()
     st.caption("Inputs, settings, and results are kept in this server session. Download results to keep them.")
     with st.expander("Session & privacy"):

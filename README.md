@@ -145,6 +145,41 @@ are a visualization, not additional measured samples. Every requested query is
 calculated at its exact coordinates; the display grid does not limit query
 precision or exports. Nearest-sample surfaces use unsmoothed cells.
 
+## Tips & tricks: Excel formula generator
+
+The final **Tips & tricks** tab generates a 1D piecewise linear interpolation
+formula from your **X range**, **Y range**, and **Xi cell or range**. It works
+independently of uploaded data and the calculation tabs. Enter bounded A1
+references, such as `$A$2:$A$7`, `$B$2:$B$7`, and `D2:D5`; sheet-qualified
+references such as `'My data'!A2:A7` are also supported.
+
+Copy the generated formula into an empty cell outside the source and query
+ranges. A query range spills Y results in the same orientation and original
+order. Leave enough empty cells for that spill. Use `$` anchors on known-data
+ranges when copying a single-query formula down.
+
+The formula uses English function names and requires **Microsoft 365 or Excel
+2024** with dynamic arrays. Choose comma or semicolon argument separators to
+match your Excel settings. Localized Excel installations may also require
+translated function names. This first version accepts row or column vectors,
+rather than named ranges, table references, or 2D interpolation.
+
+- X and Y must contain the same number of cells, with at least two numeric
+  points. Exclude headers, empty source cells, and numbers stored as text.
+- X/Y pairs are sorted together inside the formula. X values must be unique;
+  average repeated measurements before using this Excel formula. Invalid
+  reference data returns `#N/A` rather than being silently excluded or changed.
+- Empty query cells stay blank. Other nonnumeric query values return `#N/A`.
+- Outside the known X range, choose **Leave blank**, **Keep boundary value**,
+  or **Extend end slopes**. Exact sample coordinates return their known Y.
+
+The formula uses the two neighboring samples for each query. Applying
+`FORECAST.LINEAR` to all source samples instead fits a regression line and can
+give different values between samples. See Microsoft's documentation for
+[MAP](https://support.microsoft.com/en-us/excel/functions/map-function),
+[TOCOL](https://support.microsoft.com/en-us/excel/functions/tocol-function),
+and [FORECAST.LINEAR](https://support.microsoft.com/en-us/excel/functions/forecast-and-forecast-linear-functions).
+
 ## Verify changes
 
 ```powershell
@@ -154,7 +189,7 @@ precision or exports. Nearest-sample surfaces use unsmoothed cells.
 
 The suite covers imports, every interpolation method and outside-data policy,
 number previews, result persistence and recovery, uploads, charts, downloads,
-and the support widget. GitHub Actions is configured to run it on Linux and
+the Excel formula generator, and the support widget. GitHub Actions is configured to run it on Linux and
 Windows, with a 90% statement-and-branch coverage gate.
 
 See [TESTING.md](TESTING.md) for the feature map, coverage commands, CI matrix,

@@ -6,6 +6,8 @@ source =
     interpolation
     coffee_widget
     column_picker
+    excel_formulas
+    tips
 
 [report]
 show_missing = True

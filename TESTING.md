@@ -2,9 +2,9 @@
 
 The suite combines numerical expectations, parser and export contracts,
 Streamlit interaction tests, and checks of the generated chart, column picker,
-and support-link content. Tests use in-memory datasets, including a 2,501-query
-batch that guards against hidden result caps. They do not contact payment services
-or need a running browser or Streamlit server.
+Excel formulas, and support-link content. Tests use in-memory datasets, including
+a 2,501-query batch that guards against hidden result caps. They do not contact
+payment services or need a running browser or Streamlit server.
 
 ## Run the suite
 
@@ -30,13 +30,15 @@ Measure coverage and enforce the configured minimum:
 ```
 
 Open `htmlcov/index.html` for the source report. Coverage includes statements
-and branches in `main.py`, `interpolation.py`, `coffee_widget.py`, and
-`column_picker.py`, with a 90% minimum. Generated reports are ignored by Git. Coverage is a regression
-guard; the numerical assertions and workflow checks establish the behavior.
+and branches in `main.py`, `interpolation.py`, `coffee_widget.py`,
+`column_picker.py`, `excel_formulas.py`, and `tips.py`, with a 90% minimum.
+Generated reports are ignored by Git. Coverage is a regression guard; the
+numerical assertions and workflow checks establish the behavior.
 
-Verified on 25 November 2026 with the local Python 3.13 environment: all 140
+Verified on 25 November 2026 with the local Python 3.15.2 environment: all 159
 Python tests and all seven Node tests passed. Combined statement-and-branch
-coverage was 96.3%, above the 90% gate. These results cover the automated
+coverage was 96.7%, above the 90% gate. The Excel formula generator and tips
+workflow each reached 100% statement-and-branch coverage. These results cover the automated
 contracts above; the browser checks below remain separate.
 
 On macOS/Linux, use `.venv/bin/python` in place of
@@ -61,6 +63,7 @@ On macOS/Linux, use `.venv/bin/python` in place of
 | Example data | Usable example workflows and downloadable example contents | `test_app.py`, `test_app_features.py` |
 | CSV/TSV downloads | Every offered separator/decimal combination, quoting, Unicode/BOM, precision, missing values, statuses, filenames, MIME types, and unchanged numerical results when export settings change | `test_interpolation.py`, `test_core_features.py`, `test_app.py`, `test_app_features.py` |
 | Coffee support widget | Default/custom link and title, escaped attribute content, and safe new-tab attributes | `test_presentation.py` |
+| Excel formula generator | A1 reference validation, source guards, paired sorting, exact knots, vector orientation, query order, separator/policy variants, and independence from calculation state | `test_excel_formulas.py`, `test_tips.py` |
 
 All test paths above are under `tests/`. `app_test_support.py` contains common
 fixtures and assertions without test methods, so sharing setup does not run
@@ -84,6 +87,15 @@ search, geometry, and keyboard/focus handlers in a simulated DOM. Real popup
 positioning, focus, keyboard navigation, and assistive technology behavior require
 browser checks.
 
+Excel formula tests parse and evaluate the emitted expression using a small,
+independent evaluator for the functions used by this generator. Numerical
+results are checked against independently specified expected values, including
+nonlinear source data and exact sample boundaries. This catches formula-expression
+errors beyond text snapshots; it does not execute Microsoft Excel or establish
+native-engine compatibility. Native
+Excel pasting, formula localization, dynamic-array spill behavior, and workbook
+error reporting remain manual checks.
+
 Upload tests use real uploaded-file objects at the handler boundary,
 cached records for portable workflow coverage, and direct file-widget input
 when the installed Streamlit testing API supports it. Only that API-specific
@@ -92,7 +104,7 @@ file chooser.
 
 Before a release, manually check:
 
-1. Both workflows on desktop and at a 390 px viewport: no horizontal page
+1. All three tabs on desktop and at a 390 px viewport: no horizontal page
    overflow, readable results, reachable actions, and tables scrolling within
    their containers. The support link belongs in the footer.
 2. Every reference and query column picker: labeled search, case/accent and
@@ -103,6 +115,11 @@ Before a release, manually check:
    in the target spreadsheet application with point and comma decimal settings.
 4. Chart hover/zoom behavior, preservation of zoom after format-only edits,
    marker shapes, 55 × 55 derived-grid disclosure, and outside-data/blank results.
+5. Copy a generated Excel formula into Microsoft 365 or Excel 2024. Check
+   single and multiple queries, row and column orientation, exact samples,
+   each outside policy, blank/invalid cells, duplicate-X rejection, and both
+   supported argument separators. Confirm the result spills into empty cells
+   and that source/query ranges are not overwritten.
 
 No automated coverage percentage establishes accessibility, screen-reader
 behavior, responsive layout, or compatibility with every spreadsheet locale.

@@ -14,7 +14,8 @@ from tests.app_test_support import AppTestCase
 class WorkflowTests(AppTestCase):
 
     def test_both_workflows_render_and_compute_independently(self):
-        self.assertEqual(len(self.app.tabs), 2)
+        self.assertEqual(len(self.app.tabs), 3)
+        self.assertEqual(self.app.tabs[-1].label, "Tips & tricks")
         self.assertFalse(self.app.button(key="calculate_1d").disabled)
         self.assertFalse(self.app.button(key="calculate_2d").disabled)
         self.app.button(key="calculate_2d").click().run()
